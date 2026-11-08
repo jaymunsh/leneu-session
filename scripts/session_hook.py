@@ -296,7 +296,11 @@ def on_stop(data):
             action = decide_checkpoint(load_config(root), sess, tokens)
             if action != "none":
                 sess["last_ckpt"] = tokens
-                output = {"decision": "block", "reason": checkpoint_reason(root, action == "checkpoint+clear")}
+                # decision: block은 transcript에 오류로 남아 모델이 체크포인트에 오류라고 적는다
+                output = {"hookSpecificOutput": {
+                    "hookEventName": "Stop",
+                    "additionalContext": checkpoint_reason(root, action == "checkpoint+clear"),
+                }}
     save_state(root, state)
     if output:
         print(json.dumps(output, ensure_ascii=False))
@@ -727,15 +731,16 @@ def test_stop_blocks_once_per_interval():
     _stop(root, 47000)
     assert _stop(root, 146999) is None
     out = _stop(root, 147000)
-    assert out["decision"] == "block" and ".pending-checkpoint.md" in out["reason"]
-    assert "/clear" not in out["reason"]
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert out["hookSpecificOutput"]["hookEventName"] == "Stop" and "decision" not in out
+    assert ".pending-checkpoint.md" in ctx and "/clear" not in ctx
     assert _stop(root, 148000) is None  # 다음 턴에 또 재촉하지 않는다
 
 
 def test_stop_recommends_clear_at_limit():
     root = _project()
     _stop(root, 250000)
-    assert "/clear" in _stop(root, 350000)["reason"]
+    assert "/clear" in _stop(root, 350000)["hookSpecificOutput"]["additionalContext"]
 
 
 def test_stop_hook_active_never_blocks():

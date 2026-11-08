@@ -184,7 +184,8 @@ jay-session에서 이어받는 규칙: 먼저 쓰고 정말 모르는 것만 묻
 
 ## 확인 결과 (2026-11-09)
 
-- **Stop:** `{"decision":"block","reason":...}`로 계속 진행시킨다. 8회 연속 제한은 있으나 도구 호출로 초기화되고 체크포인트는 1회라 해당 없다. 문서상 `decision: block`은 transcript에 오류로 보일 수 있어, 표시 방식은 체감 검증에서 확인한다.
+- **Stop:** 설계 초안의 `decision: block` 대신 `hookSpecificOutput.additionalContext`로 계속 진행시킨다. 실측에서 `block`은 transcript에 `hook_blocking_error`로 남아 모델이 체크포인트에 "Stop hook 에러"라고 적었고, `additionalContext`는 오류 없이 같은 동작을 했다. 아래 Stop 절의 `decision` 표기는 이 방식으로 읽는다.
+- **Stop 시점의 transcript:** 마지막 응답이 아직 쓰이지 않았을 수 있다(실측). 입력의 `last_assistant_message`가 나타날 때까지 최대 2초 기다리고, 끝내 없으면 그 값으로 결과를 채운다.
 - **PreToolUse:** `hookSpecificOutput.permissionDecision: "allow"`. 사용자의 deny/ask 규칙은 그대로 적용된다.
 - **SessionStart 자동 시작:** `initialUserMessage`는 `-p` 모드용으로만 문서화되어 있다. `.` 입력으로 간다.
 - **비대화형 구분:** 문서에 없다. 실측으로 `claude -p`는 `CLAUDE_CODE_ENTRYPOINT=sdk-cli`, 대화형은 `cli`다. 값이 없으면 대화형으로 취급한다.
