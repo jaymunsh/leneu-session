@@ -14,6 +14,7 @@ import threading
 import time
 from contextlib import redirect_stdout
 from datetime import datetime
+from fnmatch import fnmatch
 from pathlib import Path
 
 
@@ -23,6 +24,7 @@ MAX_SESSIONS = 20
 PENDING = ".pending-checkpoint.md"
 MAX_INJECT = 8000
 FLUSH_WAIT = 2.0
+MAX_HANDOFFS = 10
 HEADER = re.compile(r"^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (turn|checkpoint|compact)\b.*$", re.M)
 USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
@@ -288,11 +290,17 @@ def on_stop(data):
 
     tokens = context_tokens(entries)
     consume_pending(root, tokens, sid, transcript, now)
+    handoff = latest_handoff(root)
+    handoff_id = str(handoff[1]) + str(handoff[1].stat().st_mtime) if handoff else None
 
     output = None
     if tokens is not None:
         if "last_ckpt" not in sess or tokens < sess["last_ckpt"]:  # 첫 측정 또는 압축 직후
             sess["baseline"] = sess["last_ckpt"] = tokens
+            sess["handoff_seen"] = handoff_id
+        elif handoff_id != sess.get("handoff_seen"):  # 방금 수동으로 남겼으니 겹쳐 쓰지 않는다
+            sess["handoff_seen"] = handoff_id
+            sess["last_ckpt"] = tokens
         elif not active and not is_noninteractive(_entrypoint()):
             action = decide_checkpoint(load_config(root), sess, tokens)
             if action != "none":
@@ -327,6 +335,24 @@ def latest_checkpoint(root):
     return None
 
 
+def latest_handoff(root):
+    """수동 인계 문서 중 최신. 시각은 로그 헤더와 비교하도록 분 단위로 맞춘다."""
+    files = list((root / DIR / "handoffs").glob("handoff-*.md"))
+    if not files:
+        return None
+    path = max(files, key=lambda p: p.stat().st_mtime)
+    return datetime.fromtimestamp(path.stat().st_mtime).replace(second=0, microsecond=0), path
+
+
+def _latest_source(root):
+    """복귀에 쓸 최신 기록: (시각, 본문, 경로). 같은 분이면 사람이 요청한 handoff가 우선이다."""
+    checkpoint = latest_checkpoint(root)
+    handoff = latest_handoff(root)
+    if handoff and (not checkpoint or handoff[0] >= checkpoint[0]):
+        return handoff[0], handoff[1].read_text(errors="replace"), handoff[1]
+    return checkpoint
+
+
 def turns_after(root, since):
     """같은 분에 쓰인 턴은 포함한다. 잃는 것보다 한 줄 겹치는 쪽이 낫다."""
     files = _log_files(root)
@@ -345,13 +371,13 @@ def turns_after(root, since):
 def build_context(root, source, now):
     if source not in ("clear", "startup", "compact"):
         return None
-    latest = latest_checkpoint(root)
+    latest = _latest_source(root)
     if source == "compact":
         if not latest:
             return None
         return (
             "컨텍스트 압축 직후라 하던 작업이 그대로 이어지는 중입니다. 브리핑하거나 다시 묻지 말고 계속하세요. "
-            f"압축 요약에 빠진 것이 있을 때만 {latest[2]} 의 마지막 체크포인트를 보세요."
+            f"압축 요약에 빠진 것이 있을 때만 {latest[2]} 의 마지막 기록을 보세요."
         )
     since, body, path = latest or (None, "", None)
     turns = turns_after(root, since)
@@ -376,15 +402,18 @@ def build_context(root, source, now):
         turns = turns[-room:] if room else ""
     parts = [guidance, body]
     if turns:
-        parts.append("체크포인트 이후의 턴 기록:\n" + turns)
+        parts.append("그 이후의 턴 기록:\n" + turns)
     return "\n\n".join(p for p in parts if p)
 
 
 def is_allowed_write(root, file_path):
-    """자동 승인은 이 경로뿐이다. 심볼릭 링크로 밖을 가리키면 허용하지 않는다."""
+    """자동 승인은 이 경로들뿐이다. 심볼릭 링크로 밖을 가리키면 허용하지 않는다."""
     if not file_path:
         return False
-    return Path(file_path).resolve() == root / DIR / PENDING
+    path = Path(file_path).resolve()
+    if path == root / DIR / PENDING:
+        return True
+    return path.parent == root / DIR / "handoffs" and fnmatch(path.name, "handoff-*.md")
 
 
 def is_noninteractive(entrypoint):
@@ -477,7 +506,7 @@ def on_pre_tool_use(data):
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "leneu-session 체크포인트",
+            "permissionDecisionReason": "leneu-session 기록",
         }}, ensure_ascii=False))
 
 
@@ -507,6 +536,24 @@ def cli_init(cwd):
     if existed:
         return f"이미 켜져 있습니다: {folder}\n로그 파일 {len(_log_files(target))}개."
     return f"leneu-session을 켰습니다: {folder}\n훅은 다음 턴부터 기록합니다."
+
+
+def cli_handoff_path(cwd, now):
+    """새 handoff 경로를 정해 준다. 시각을 모델이 짐작하지 않게 하고, 새 문서 자리를 비운다."""
+    target = _project_dir(cwd)
+    folder = target / DIR
+    if not folder.is_dir():
+        _create_folder(target)
+        (folder / "disabled").touch()  # 인계만 요청한 것이다. 자동 기록은 /leneu-init으로 켠다
+    handoffs = folder / "handoffs"
+    handoffs.mkdir(exist_ok=True)
+    old = sorted(handoffs.glob("handoff-*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[MAX_HANDOFFS - 1:]
+    for p in old:
+        p.unlink()
+    lines = [str(handoffs / f"handoff-{now:%Y%m%d-%H%M}.md")]
+    if old:
+        lines.append(f"오래된 handoff {len(old)}개를 지웠습니다.")
+    return "\n".join(lines)
 
 
 def cli_stop(cwd):
@@ -1069,6 +1116,98 @@ def test_session_start_shows_errors_to_user():
     assert _capture(on_session_start, {"cwd": str(root), "source": "resume"}) is None
 
 
+def _handoff(root, name, body, when):
+    d = root / ".leneu-session" / "handoffs"
+    d.mkdir(exist_ok=True)
+    p = d / name
+    p.write_text(body)
+    os.utime(p, (when.timestamp(), when.timestamp()))
+    return p
+
+
+def test_latest_handoff_uses_newest_mtime():
+    root = _project()
+    assert latest_handoff(root) is None
+    _handoff(root, "handoff-1.md", "옛것", datetime(2026, 11, 9, 10, 0, 30))
+    new = _handoff(root, "handoff-2.md", "새것", datetime(2026, 11, 9, 11, 0, 30))
+    (root / ".leneu-session" / "handoffs" / "other.md").write_text("무관")
+    assert latest_handoff(root) == (datetime(2026, 11, 9, 11, 0), new)
+
+
+def test_build_context_prefers_newer_handoff_with_later_turns():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT + TURN)
+    _handoff(root, "handoff-1.md", "인계 본문표식", datetime(2026, 11, 9, 14, 30, 40))
+    c = build_context(root, "clear", NOW)
+    assert "인계 본문표식" in c and "체크포인트 본문표식" not in c
+    assert "이후 턴표식" in c  # 같은 분의 턴을 잃지 않는다
+
+
+def test_build_context_prefers_newer_checkpoint_over_old_handoff():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    _handoff(root, "handoff-1.md", "인계 본문표식", datetime(2026, 11, 9, 9, 0))
+    c = build_context(root, "clear", NOW)
+    assert "체크포인트 본문표식" in c and "인계 본문표식" not in c
+
+
+def test_build_context_compact_points_to_handoff_when_newest():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    _handoff(root, "handoff-1.md", "인계 본문표식", datetime(2026, 11, 9, 14, 40))
+    c = build_context(root, "compact", NOW)
+    assert "handoff-1.md" in c and "인계 본문표식" not in c
+
+
+def test_stop_new_handoff_resets_interval_without_checkpoint():
+    root = _project()
+    _handoff(root, "handoff-0.md", "세션 전", datetime(2026, 11, 8))
+    _stop(root, 47000)
+    _handoff(root, "handoff-1.md", "수동", datetime(2026, 11, 9, 14, 40))
+    assert _stop(root, 150000) is None
+    assert load_state(root)["s1"]["last_ckpt"] == 150000
+    assert _stop(root, 200000) is None
+    assert _stop(root, 250000) is not None
+
+
+def test_stop_old_handoff_does_not_suppress_checkpoint():
+    root = _project()
+    _handoff(root, "handoff-0.md", "세션 전", datetime(2026, 11, 8))
+    _stop(root, 47000)
+    assert _stop(root, 150000) is not None
+
+
+def test_is_allowed_write_handoffs_only_direct_children():
+    root = _project()
+    d = root / ".leneu-session/handoffs"
+    assert is_allowed_write(root, str(d / "handoff-20261109-1430.md"))
+    assert not is_allowed_write(root, str(d / "other.md"))
+    assert not is_allowed_write(root, str(d / "sub/handoff-1.md"))
+    assert not is_allowed_write(root, str(d / "../handoff-1.md"))
+    assert not is_allowed_write(root, str(d / "handoff-1.txt"))
+
+
+def test_cli_handoff_path_prunes_to_make_room():
+    root = _project()
+    for i in range(12):
+        _handoff(root, f"handoff-{i:02}.md", "x", datetime(2026, 11, 1 + i))
+    out = cli_handoff_path(str(root), datetime(2026, 11, 20, 14, 30))
+    assert str(root / ".leneu-session/handoffs/handoff-20261120-1430.md") in out
+    assert "3" in out  # 지운 개수를 알린다
+    left = {p.name for p in (root / ".leneu-session/handoffs").iterdir()}
+    assert len(left) == 9 and "handoff-11.md" in left and "handoff-00.md" not in left
+
+
+def test_cli_handoff_path_uninitialized_keeps_auto_off():
+    d = Path(tempfile.mkdtemp()).resolve()
+    (d / ".git").mkdir()
+    out = cli_handoff_path(str(d), datetime(2026, 11, 20, 14, 30))
+    assert "handoff-20261120-1430.md" in out
+    assert (d / ".leneu-session" / ".gitignore").exists()
+    assert (d / ".leneu-session" / "disabled").exists()  # 자동 기록은 동의 없이 켜지 않는다
+    assert find_root(str(d)) is None
+
+
 def _write_log(root, date, text):
     (root / ".leneu-session" / "logs" / f"{date}.md").write_text(text)
 
@@ -1261,5 +1400,7 @@ if __name__ == "__main__":
         print(cli_init(os.getcwd()))
     elif "--stop" in sys.argv:
         print(cli_stop(os.getcwd()))
+    elif "--handoff-path" in sys.argv:
+        print(cli_handoff_path(os.getcwd(), datetime.now()))
     else:
         main()
