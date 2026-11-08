@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -292,7 +293,7 @@ def on_stop(data):
     if tokens is not None:
         if "last_ckpt" not in sess or tokens < sess["last_ckpt"]:  # 첫 측정 또는 압축 직후
             sess["baseline"] = sess["last_ckpt"] = tokens
-        elif not active:
+        elif not active and not is_noninteractive(_entrypoint()):
             action = decide_checkpoint(load_config(root), sess, tokens)
             if action != "none":
                 sess["last_ckpt"] = tokens
@@ -386,15 +387,86 @@ def is_allowed_write(root, file_path):
     return Path(file_path).resolve() == root / DIR / PENDING
 
 
+def is_noninteractive(entrypoint):
+    """claude -p 는 sdk-cli, 대화형은 cli (2026-11-09 실측, 공식 문서에는 없음). 모르면 대화형으로 본다."""
+    return bool(entrypoint) and entrypoint.startswith("sdk")
+
+
+def _entrypoint():
+    return os.environ.get("CLAUDE_CODE_ENTRYPOINT")
+
+
+def _create_folder(target):
+    folder = target / DIR
+    (folder / "logs").mkdir(parents=True, exist_ok=True)
+    if not (folder / ".gitignore").exists():
+        (folder / ".gitignore").write_text("*\n")
+
+
+def ensure_worktree(cwd):
+    """로그 폴더는 git에서 제외되어 새 worktree에 없다. 메인이 켜져 있으면 여기도 켠다."""
+    start = Path(cwd or os.getcwd()).resolve()
+    target = next((d for d in (start, *start.parents) if (d / ".git").exists()), None)
+    if target is None or not (target / ".git").is_file() or (target / DIR).exists():
+        return None
+    try:
+        line = (target / ".git").read_text().strip()
+        if not line.startswith("gitdir:"):
+            return None
+        gitdir = (target / line[len("gitdir:"):].strip()).resolve()
+        main = (gitdir / (gitdir / "commondir").read_text().strip()).resolve().parent
+    except OSError:  # 서브모듈에는 commondir이 없다
+        return None
+    if not (main / DIR).is_dir() or (main / DIR / "disabled").exists():
+        return None
+    _create_folder(target)
+    if (main / DIR / "config.json").exists():
+        shutil.copy(main / DIR / "config.json", target / DIR / "config.json")
+    return target
+
+
+def new_errors(root):
+    """새 오류를 한 번만 알리고 지난 기록으로 옮긴다."""
+    log = root / DIR / "hook-errors.log"
+    if not log.exists():
+        return None
+    lines = log.read_text(errors="replace").splitlines()
+    with (root / DIR / "hook-errors.old.log").open("a") as f:
+        f.write("".join(l + "\n" for l in lines))
+    log.unlink()
+    if not lines:
+        return None
+    return f"leneu-session 훅 오류 {len(lines)}건 (hook-errors.old.log). 마지막: {lines[-1][:200]}"
+
+
 def on_session_start(data):
+    if is_noninteractive(_entrypoint()):
+        return
+    ensure_worktree(data.get("cwd"))
     root = find_root(data.get("cwd"))
     if root is None:
         return
+    output = {}
+    errors = new_errors(root)
+    if errors:
+        output["systemMessage"] = errors
     context = build_context(root, data.get("source"), datetime.now())
     if context:
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "SessionStart", "additionalContext": context,
-        }}, ensure_ascii=False))
+        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
+    if output:
+        print(json.dumps(output, ensure_ascii=False))
+
+
+def on_precompact(data):
+    """압축은 컨텍스트만 지우고 transcript는 남는다. 원본 위치만 적어 둔다."""
+    root = find_root(data.get("cwd"))
+    if root is None:
+        return
+    now = datetime.now()
+    append_log(root, (
+        f"\n## {now:%Y-%m-%d %H:%M} compact\n"
+        f"**메모:** 컨텍스트 압축({data.get('trigger', '?')}). 압축 전 원본: {data.get('transcript_path', '?')}\n"
+    ), now)
 
 
 def on_pre_tool_use(data):
@@ -428,9 +500,7 @@ def cli_init(cwd):
         return "홈 폴더에서는 켜지 않습니다. 하위의 모든 폴더에 적용되기 때문입니다. 프로젝트 폴더에서 실행하세요."
     existed = folder.is_dir()
     disabled = (folder / "disabled").exists()
-    (folder / "logs").mkdir(parents=True, exist_ok=True)
-    if not (folder / ".gitignore").exists():
-        (folder / ".gitignore").write_text("*\n")
+    _create_folder(target)
     if disabled:
         (folder / "disabled").unlink()
         return f"leneu-session을 다시 켰습니다: {folder}\n기존 기록은 그대로이며 다음 턴부터 다시 기록합니다."
@@ -450,7 +520,12 @@ def cli_stop(cwd):
     )
 
 
-HANDLERS = {"Stop": on_stop, "SessionStart": on_session_start, "PreToolUse": on_pre_tool_use}
+HANDLERS = {
+    "Stop": on_stop,
+    "SessionStart": on_session_start,
+    "PreToolUse": on_pre_tool_use,
+    "PreCompact": on_precompact,
+}
 
 
 def main():
@@ -875,6 +950,125 @@ def test_stop_late_flush_keeps_reply_without_duplicates():
     assert "**결과:** 첫 답" in text and "**요청:** 둘째" in text and "둘째 답" in text
 
 
+def _with_entrypoint(value, fn):
+    old = os.environ.get("CLAUDE_CODE_ENTRYPOINT")
+    os.environ["CLAUDE_CODE_ENTRYPOINT"] = value
+    try:
+        return fn()
+    finally:
+        if old is None:
+            del os.environ["CLAUDE_CODE_ENTRYPOINT"]
+        else:
+            os.environ["CLAUDE_CODE_ENTRYPOINT"] = old
+
+
+def test_is_noninteractive():
+    assert is_noninteractive("sdk-cli") and is_noninteractive("sdk-ts")
+    assert not is_noninteractive("cli") and not is_noninteractive(None)
+
+
+def test_stop_noninteractive_records_turn_without_checkpoint():
+    root = _project()
+    _with_entrypoint("sdk-cli", lambda: _stop(root, 47000, prompt="헤드리스"))
+    assert _with_entrypoint("sdk-cli", lambda: _stop(root, 500000)) is None
+    assert "헤드리스" in _log_text(root)
+
+
+def test_session_start_noninteractive_injects_nothing():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    data = {"cwd": str(root), "source": "startup"}
+    assert _with_entrypoint("sdk-cli", lambda: _capture(on_session_start, data)) is None
+
+
+def test_on_precompact_records_without_affecting_lookup():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    on_precompact({"cwd": str(root), "trigger": "auto", "transcript_path": "/tmp/t.jsonl"})
+    text = _log_text(root)
+    assert " compact" in text and "/tmp/t.jsonl" in text and "auto" in text
+    assert "체크포인트 본문표식" in latest_checkpoint(root)[1]
+    assert "compact" not in latest_checkpoint(root)[1]
+
+
+def _worktree(main_enabled=True):
+    main = Path(tempfile.mkdtemp()).resolve()
+    (main / ".git" / "worktrees" / "w").mkdir(parents=True)
+    (main / ".git" / "worktrees" / "w" / "commondir").write_text("../..\n")
+    if main_enabled:
+        (main / ".leneu-session" / "logs").mkdir(parents=True)
+    wt = Path(tempfile.mkdtemp()).resolve()
+    (wt / ".git").write_text(f"gitdir: {main}/.git/worktrees/w\n")
+    return main, wt
+
+
+def test_ensure_worktree_enables_when_main_is_on():
+    main, wt = _worktree()
+    (main / ".leneu-session" / "config.json").write_text('{"context_window": 200000}')
+    (wt / "sub").mkdir()
+    assert ensure_worktree(str(wt / "sub")) == wt
+    assert (wt / ".leneu-session" / ".gitignore").read_text() == "*\n"
+    assert (wt / ".leneu-session" / "logs").is_dir()
+    assert load_config(wt)["context_window"] == 200000
+    assert find_root(str(wt)) == wt
+
+
+def test_ensure_worktree_skips_when_main_off_or_disabled():
+    _, wt = _worktree(main_enabled=False)
+    assert ensure_worktree(str(wt)) is None and not (wt / ".leneu-session").exists()
+    main, wt2 = _worktree()
+    (main / ".leneu-session" / "disabled").touch()
+    assert ensure_worktree(str(wt2)) is None and not (wt2 / ".leneu-session").exists()
+
+
+def test_ensure_worktree_ignores_normal_repo_and_submodule():
+    d = Path(tempfile.mkdtemp()).resolve()
+    (d / ".git").mkdir()
+    assert ensure_worktree(str(d)) is None
+    sub = Path(tempfile.mkdtemp()).resolve()
+    (sub / "modules" / "m").mkdir(parents=True)  # 서브모듈에는 commondir이 없다
+    (d / "m").mkdir()
+    (d / "m" / ".git").write_text(f"gitdir: {sub}/modules/m\n")
+    assert ensure_worktree(str(d / "m")) is None
+
+
+def test_ensure_worktree_keeps_existing_and_handles_broken_git_file():
+    main, wt = _worktree()
+    (wt / ".leneu-session").mkdir()
+    (wt / ".leneu-session" / "disabled").touch()
+    assert ensure_worktree(str(wt)) is None and find_root(str(wt)) is None
+    d = Path(tempfile.mkdtemp()).resolve()
+    (d / ".git").write_text("쓰레기\n")
+    assert ensure_worktree(str(d)) is None
+
+
+def test_session_start_autostarts_worktree():
+    _, wt = _worktree()
+    _capture(on_session_start, {"cwd": str(wt), "source": "startup"})
+    assert (wt / ".leneu-session").is_dir()
+
+
+def test_new_errors_reports_once():
+    root = _project()
+    assert new_errors(root) is None
+    log_error(root, ValueError("하나"))
+    log_error(root, ValueError("둘"))
+    msg = new_errors(root)
+    assert "2" in msg and "둘" in msg and "hook-errors" in msg
+    assert new_errors(root) is None
+    log_error(root, ValueError("셋"))
+    assert "셋" in new_errors(root)
+    assert "하나" in (root / ".leneu-session" / "hook-errors.old.log").read_text()
+
+
+def test_session_start_shows_errors_to_user():
+    root = _project()
+    log_error(root, ValueError("터짐"))
+    out = _capture(on_session_start, {"cwd": str(root), "source": "resume"})
+    assert "터짐" in out["systemMessage"] and "hookSpecificOutput" not in out
+    assert _capture(on_session_start, {"cwd": str(root), "source": "resume"}) is None
+
+
 def _write_log(root, date, text):
     (root / ".leneu-session" / "logs" / f"{date}.md").write_text(text)
 
@@ -1047,6 +1241,7 @@ def test_cli_stop_without_folder_creates_nothing():
 
 
 def selftest():
+    os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # 어디서 돌려도 대화형 기준으로 검사한다
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:
