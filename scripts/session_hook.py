@@ -23,6 +23,7 @@ DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_ev
 MAX_SESSIONS = 20
 PENDING = ".pending-checkpoint.md"
 MAX_INJECT = 8000
+TURNS_ROOM = 2000
 FLUSH_WAIT = 2.0
 MAX_HANDOFFS = 10
 HEADER = re.compile(r"^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (turn|checkpoint|compact)\b.*$", re.M)
@@ -31,6 +32,8 @@ EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 SYSTEM_TAG = re.compile(
     r"<(system-reminder|task-notification|command-[a-z-]+|local-command-[a-z-]+)>.*?</\1>", re.S
 )
+COMMAND = re.compile(r"\s*(?:<command-message>.*?</command-message>\s*)?<command-name>(.*?)</command-name>", re.S)
+COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 SECRET = re.compile(
     r"\bsk-[\w-]{16,}|\bghp_\w{16,}|\bgithub_pat_\w{10,}|\bAKIA[0-9A-Z]{16}\b"
     r"|\bBearer\s+[\w.~+/-]{10,}|\bxox[bp]-[\w-]{8,}"
@@ -66,7 +69,10 @@ def load_config(root):
 
 
 def load_state(root):
-    return _read_json_dict(root / DIR / ".state.json")
+    return {
+        sid: sess for sid, sess in _read_json_dict(root / DIR / ".state.json").items()
+        if isinstance(sess, dict) and isinstance(sess.get("last_ckpt", 0), (int, float))
+    }
 
 
 def save_state(root, state):
@@ -97,20 +103,26 @@ def load_transcript(path):
     if not p.is_file():
         return []
     out = []
-    for line in p.read_text(errors="replace").splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(e, dict):
-            out.append(e)
+    with p.open(encoding="utf-8", errors="replace") as f:  # splitlines는 문자열 속 U+2028에서도 끊는다
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict):
+                out.append(e)
     return out
+
+
+def _message(entry):
+    m = entry.get("message")
+    return m if isinstance(m, dict) else {}
 
 
 def _last_main_text(entries):
     for e in reversed(entries):
         if e.get("type") == "assistant" and not e.get("isSidechain"):
-            text = _text(e.get("message", {}).get("content")).strip()
+            text = _text(_message(e).get("content")).strip()
             if text:
                 return text
     return None
@@ -134,8 +146,8 @@ def context_tokens(entries):
     for e in reversed(entries):
         if e.get("isSidechain") or e.get("type") != "assistant":
             continue
-        usage = e.get("message", {}).get("usage")
-        if not usage:
+        usage = _message(e).get("usage")
+        if not usage or not isinstance(usage, dict):
             continue
         try:
             total = sum(usage.get(k, 0) for k in USAGE_KEYS)
@@ -151,7 +163,19 @@ def _text(content):
         return content
     if not isinstance(content, list):
         return ""
-    return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return "\n".join(
+        b["text"] for b in content
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+    )
+
+
+def _prompt(text):
+    """슬래시 명령은 `/이름 인자`로 적는다. 펼쳐진 본문은 isMeta로 따로 온다."""
+    command = COMMAND.match(text)
+    if not command:
+        return SYSTEM_TAG.sub("", text).strip(), False
+    args = COMMAND_ARGS.search(text)
+    return f"{command.group(1)} {args.group(1) if args else ''}".strip(), True
 
 
 def parse_turns(entries):
@@ -160,26 +184,29 @@ def parse_turns(entries):
     for e in entries:
         if e.get("isSidechain"):
             continue
-        content = e.get("message", {}).get("content")
+        content = _message(e).get("content")
         if e.get("type") == "user":
             if e.get("isMeta") or e.get("isCompactSummary"):
                 continue
-            prompt = SYSTEM_TAG.sub("", _text(content)).strip()
+            prompt, command = _prompt(_text(content))
             if prompt:
-                turns.append({"prompt": prompt, "reply": "", "tools": [], "files": []})
+                turns.append({"prompt": prompt, "reply": "", "tools": [], "files": [], "command": command})
         elif e.get("type") == "assistant" and turns:
             turn = turns[-1]
             for b in content if isinstance(content, list) else []:
                 if not isinstance(b, dict):
                     continue
-                if b.get("type") == "text" and b.get("text", "").strip():
+                if b.get("type") == "text" and _text([b]).strip():
                     turn["reply"] = (turn["reply"] + "\n\n" + b["text"].strip()).strip()
                 elif b.get("type") == "tool_use":
-                    turn["tools"].append(b.get("name", ""))
-                    path = (b.get("input") or {}).get("file_path")
-                    if b.get("name") in EDIT_TOOLS and path and path not in turn["files"]:
+                    name = b.get("name")
+                    turn["tools"].append(name if isinstance(name, str) else "?")
+                    tool_input = b.get("input")
+                    path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+                    if name in EDIT_TOOLS and isinstance(path, str) and path not in turn["files"]:
                         turn["files"].append(path)
-    return turns
+    # /clear 같은 로컬 명령은 응답이 없다. 마지막 항목은 응답이 아직 안 쓰였을 수 있어 남긴다
+    return [t for t in turns[:-1] if not t["command"] or t["reply"] or t["tools"]] + turns[-1:]
 
 
 def mask_secrets(text):
@@ -187,15 +214,17 @@ def mask_secrets(text):
     return SECRET.sub("[비밀값 가림]", text)
 
 
-def _clip(s, n):
+def _clip(s, n, tail=False):
     s = " ".join(mask_secrets(s).split())
-    return s if len(s) <= n else s[: n - 1] + "…"
+    if len(s) <= n:
+        return s
+    return "…" + s[1 - n:] if tail else s[: n - 1] + "…"
 
 
 def render_turn(turn, now):
     lines = ["", f"## {now:%Y-%m-%d %H:%M} turn", f"**요청:** {_clip(turn['prompt'], 400)}"]
     if turn["reply"]:
-        lines.append(f"**결과:** {_clip(turn['reply'], 600)}")
+        lines.append(f"**결과:** {_clip(turn['reply'], 600, tail=True)}")  # 결론은 끝에 있다
     if turn["files"]:
         lines.append("**변경:** " + ", ".join(turn["files"]))
     if turn["tools"]:
@@ -206,7 +235,7 @@ def render_turn(turn, now):
 def append_log(root, text, now):
     path = root / DIR / "logs" / f"{now:%Y-%m-%d}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
+    with path.open("a", encoding="utf-8", errors="backslashreplace") as f:  # 짝 없는 서로게이트가 올 수 있다
         f.write(text)
     return path
 
@@ -224,7 +253,7 @@ def checkpoint_reason(root, recommend_clear):
         "leneu-session 체크포인트 시점입니다. 다른 작업을 시작하지 말고 아래 파일 하나만 Write로 작성하세요.",
         f"파일: {path}",
         "다음 세션이 이 파일만 읽고 이어갈 수 있게, 줄거리가 아니라 행동에 필요한 것만 씁니다. "
-        "비밀값은 적지 마세요. 헤더는 ###만 씁니다. 해당 없는 항목은 뺍니다.",
+        "비밀값은 적지 마세요. 헤더는 ###만 씁니다. 해당 없는 항목은 뺍니다. 전체 6000자 이내로 씁니다.",
         "### 현재 작업의 요구와 사용자 정정 (원문) — 요약하지 말고 원문 그대로. 이전 체크포인트의 원문도 이어 적고, 새 작업으로 넘어갔다면 이전 작업의 요구는 뺀다",
         "### 확인된 사실 (경로·명령·값·에러)",
         "### 변경 파일과 검증 여부",
@@ -248,18 +277,21 @@ def consume_pending(root, tokens, session_id, transcript_path, now):
         body = mask_secrets(re.sub(r"^#{1,2} ", "### ", body, flags=re.M))
         append_log(root, (
             f"\n## {now:%Y-%m-%d %H:%M} checkpoint tokens={tokens or '?'} session={session_id[:8]}\n"
-            f"**원본:** {transcript_path}\n{body}\n"
+            + (f"**원본:** {transcript_path}\n" if transcript_path else "")
+            + f"{body}\n"
         ), now)
     pending.unlink()
     return bool(body)
 
 
-def _after_cursor(entries, cursor):
+def _new_turns(entries, cursor):
+    """커서 뒤의 턴들. 커서를 모르면 이전 턴이 이미 기록됐거나 기록하면 안 되는 것일 수 있어
+    (상태 파일 손상, 세션 중간에 켜기, fork) 마지막 턴만 남긴다. 로그는 지울 수 없기 때문이다."""
     if cursor:
         for i, e in enumerate(entries):
             if e.get("uuid") == cursor:
-                return entries[i + 1:]
-    return entries
+                return parse_turns(entries[i + 1:])
+    return parse_turns(entries)[-1:]
 
 
 def on_stop(data):
@@ -277,40 +309,42 @@ def on_stop(data):
     sess = state.pop(sid, {})
     state[sid] = sess  # 최근 사용한 세션을 뒤로 보내 오래된 것부터 지워지게 한다
 
-    if not active:
-        turns = parse_turns(_after_cursor(entries, sess.get("cursor")))
-        if turns and message and message.strip() not in turns[-1]["reply"]:
-            turns[-1]["reply"] = (turns[-1]["reply"] + "\n\n" + message.strip()).strip()
-        for turn in turns:
-            append_log(root, render_turn(turn, now), now)
-    for e in reversed(entries):  # 끝에는 uuid 없는 메타 항목이 올 수 있다
-        if e.get("uuid"):
-            sess["cursor"] = e["uuid"]
-            break
-
-    tokens = context_tokens(entries)
-    consume_pending(root, tokens, sid, transcript, now)
-    handoff = latest_handoff(root)
-    handoff_id = str(handoff[1]) + str(handoff[1].stat().st_mtime) if handoff else None
-
     output = None
-    if tokens is not None:
-        if "last_ckpt" not in sess or tokens < sess["last_ckpt"]:  # 첫 측정 또는 압축 직후
-            sess["baseline"] = sess["last_ckpt"] = tokens
-            sess["handoff_seen"] = handoff_id
-        elif handoff_id != sess.get("handoff_seen"):  # 방금 수동으로 남겼으니 겹쳐 쓰지 않는다
-            sess["handoff_seen"] = handoff_id
-            sess["last_ckpt"] = tokens
-        elif not active and not is_noninteractive(_entrypoint()):
-            action = decide_checkpoint(load_config(root), sess, tokens)
-            if action != "none":
+    try:
+        if not active:
+            turns = _new_turns(entries, sess.get("cursor"))
+            if turns and message and message.strip() not in turns[-1]["reply"]:
+                turns[-1]["reply"] = (turns[-1]["reply"] + "\n\n" + message.strip()).strip()
+            for turn in turns:
+                append_log(root, render_turn(turn, now), now)
+
+        tokens = context_tokens(entries)
+        consume_pending(root, tokens, sid, transcript, now)
+        handoff = latest_handoff(root)
+        handoff_id = str(handoff[1]) + str(handoff[1].stat().st_mtime) if handoff else None
+
+        if tokens is not None:
+            if "last_ckpt" not in sess or tokens < sess["last_ckpt"]:  # 첫 측정 또는 압축 직후
+                sess["baseline"] = sess["last_ckpt"] = tokens
+                sess["handoff_seen"] = handoff_id
+            elif handoff_id != sess.get("handoff_seen"):  # 방금 수동으로 남겼으니 겹쳐 쓰지 않는다
+                sess["handoff_seen"] = handoff_id
                 sess["last_ckpt"] = tokens
-                # decision: block은 transcript에 오류로 남아 모델이 체크포인트에 오류라고 적는다
-                output = {"hookSpecificOutput": {
-                    "hookEventName": "Stop",
-                    "additionalContext": checkpoint_reason(root, action == "checkpoint+clear"),
-                }}
-    save_state(root, state)
+            elif not active and not is_noninteractive(_entrypoint()):
+                action = decide_checkpoint(load_config(root), sess, tokens)
+                if action != "none":
+                    sess["last_ckpt"] = tokens
+                    # decision: block은 transcript에 오류로 남아 모델이 체크포인트에 오류라고 적는다
+                    output = {"hookSpecificOutput": {
+                        "hookEventName": "Stop",
+                        "additionalContext": checkpoint_reason(root, action == "checkpoint+clear"),
+                    }}
+    finally:  # 커서를 못 남기면 다음 Stop마다 같은 턴이 다시 쌓이고 같은 오류가 반복된다
+        for e in reversed(entries):  # 끝에는 uuid 없는 메타 항목이 올 수 있다
+            if e.get("uuid"):
+                sess["cursor"] = e["uuid"]
+                break
+        save_state(root, state)
     if output:
         print(json.dumps(output, ensure_ascii=False))
 
@@ -320,7 +354,11 @@ def _sections(text):
     matches = list(HEADER.finditer(text))
     for m, nxt in zip(matches, [*matches[1:], None]):
         end = nxt.start() if nxt else len(text)
-        yield datetime.strptime(m.group(1), "%Y-%m-%d %H:%M"), m.group(2), text[m.start():end].strip()
+        try:
+            when = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
+        except ValueError:  # 손으로 쓴 잘못된 헤더 하나가 복귀 전체를 막으면 안 된다
+            continue
+        yield when, m.group(2), text[m.start():end].strip()
 
 
 def _log_files(root):
@@ -396,8 +434,12 @@ def build_context(root, source, now):
         if (now - written).total_seconds() > 24 * 3600:
             guidance += " 하루 이상 지난 기록이니 이어갈지 먼저 사용자에게 물어보세요."
 
-    body = body[:MAX_INJECT]
-    room = MAX_INJECT - len(body)
+    # 다음 액션은 체크포인트 끝에 있어 앞뒤를 모두 남기고, 이후 턴 자리도 남긴다
+    limit = MAX_INJECT - min(len(turns), TURNS_ROOM)
+    if len(body) > limit:
+        keep = (limit - 100) // 2
+        body = f"{body[:keep]}\n\n[중략 {len(body) - 2 * keep}자. 전체: {path}]\n\n{body[-keep:]}"
+    room = max(0, MAX_INJECT - len(body))
     if len(turns) > room:
         turns = turns[-room:] if room else ""
     parts = [guidance, body]
@@ -468,6 +510,13 @@ def new_errors(root):
     return f"leneu-session 훅 오류 {len(lines)}건 (hook-errors.old.log). 마지막: {lines[-1][:200]}"
 
 
+def _recover_pending(root):
+    """Stop 전에 끊긴 세션의 체크포인트. 쓰인 시각으로 넣고, 어느 세션 것인지 모르니 적지 않는다."""
+    pending = root / DIR / PENDING
+    if pending.exists():
+        consume_pending(root, None, "?", None, datetime.fromtimestamp(pending.stat().st_mtime))
+
+
 def on_session_start(data):
     if is_noninteractive(_entrypoint()):
         return
@@ -476,12 +525,16 @@ def on_session_start(data):
     if root is None:
         return
     output = {}
+    try:
+        _recover_pending(root)
+        context = build_context(root, data.get("source"), datetime.now())
+        if context:
+            output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
+    except Exception as e:  # /clear에서 기록을 못 넣었다면 지금 알려야 한다
+        log_error(root, e)
     errors = new_errors(root)
     if errors:
         output["systemMessage"] = errors
-    context = build_context(root, data.get("source"), datetime.now())
-    if context:
-        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
     if output:
         print(json.dumps(output, ensure_ascii=False))
 
@@ -532,6 +585,7 @@ def cli_init(cwd):
     _create_folder(target)
     if disabled:
         (folder / "disabled").unlink()
+        (folder / ".state.json").unlink(missing_ok=True)  # 꺼져 있던 동안의 턴을 기록하지 않는다
         return f"leneu-session을 다시 켰습니다: {folder}\n기존 기록은 그대로이며 다음 턴부터 다시 기록합니다."
     if existed:
         return f"이미 켜져 있습니다: {folder}\n로그 파일 {len(_log_files(target))}개."
@@ -883,10 +937,13 @@ def test_stop_resets_after_compaction():
 def test_stop_records_all_new_turns_once():
     root = _project()
     t = root / "t.jsonl"
+    data = {"cwd": str(root), "session_id": "s", "transcript_path": str(t)}
+    t.write_text(json.dumps(dict(_user("처음"), uuid="0")) + "\n")
+    _capture(on_stop, data)  # 커서를 잡는다
     entries = [dict(_user("첫째"), uuid="1"), dict(_assistant("답1", usage=USAGE), uuid="2"),
                dict(_user("둘째"), uuid="3"), dict(_assistant("답2", usage=USAGE), uuid="4")]
-    t.write_text("".join(json.dumps(e) + "\n" for e in entries))
-    data = {"cwd": str(root), "session_id": "s", "transcript_path": str(t)}
+    with t.open("a") as f:
+        f.write("".join(json.dumps(e) + "\n" for e in entries))
     _capture(on_stop, data)
     _capture(on_stop, data)
     text = _log_text(root)
@@ -1377,6 +1434,167 @@ def test_cli_stop_without_folder_creates_nothing():
     (d / ".git").mkdir()
     cli_stop(str(d))
     assert not (d / ".leneu-session").exists()
+
+
+def _append(t, *entries, **kw):
+    with t.open("a", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, **kw) + "\n")
+
+
+def test_stop_survives_malformed_entries_without_repeating():
+    malformed = [
+        {"type": "user", "uuid": "b", "message": None},
+        {"type": "assistant", "uuid": "b", "message": "문자열"},
+        {"type": "assistant", "uuid": "b", "message": {"usage": 5, "content": []}},
+        {"type": "assistant", "uuid": "b", "message": {"content": [{"type": "text", "text": None}]}},
+        {"type": "assistant", "uuid": "b", "message": {"content": [{"type": "tool_use", "name": "Edit", "input": "x"}]}},
+        {"type": "assistant", "uuid": "b", "message": {"content": [{"type": "tool_use", "name": None, "input": {"file_path": 3}}]}},
+    ]
+    for bad in malformed:
+        root = _project()
+        _stop(root, 47000, prompt="앞요청")
+        _append(root / "t-s1.jsonl", bad)
+        _stop(root, 47000, prompt="뒤요청")
+        _stop(root, 47000, prompt="끝요청")
+        text = _log_text(root)
+        assert all(text.count(p) == 1 for p in ("앞요청", "뒤요청", "끝요청")), (bad, text)
+
+
+def test_stop_survives_lone_surrogate():
+    root = _project()
+    _stop(root, 47000, prompt="이모지\ud83d끝")
+    _stop(root, 47000, prompt="다음")
+    text = _log_text(root)
+    assert text.count("이모지") == 1 and "다음" in text and "cursor" in load_state(root)["s1"]
+
+
+def test_stop_saves_cursor_when_logging_fails():
+    root = _project()
+    _stop(root, 47000, prompt="먼저")
+    old, globals()["append_log"] = append_log, lambda *a: (_ for _ in ()).throw(OSError("디스크"))
+    try:
+        _stop(root, 47000, prompt="실패턴")
+        assert False, "오류는 main까지 올라가 기록되어야 한다"
+    except OSError:
+        pass
+    finally:
+        globals()["append_log"] = old
+    _stop(root, 47000, prompt="회복")
+    text = _log_text(root)
+    assert text.count("먼저") == 1 and text.count("회복") == 1 and "실패턴" not in text
+
+
+def test_stop_recovers_from_wrong_shape_state():
+    for broken in ('{"s1": 5}', '{"s1": {"last_ckpt": "x"}}', '{"s1": []}'):
+        root = _project()
+        (root / ".leneu-session" / ".state.json").write_text(broken)
+        assert _stop(root, 47000) is None
+        assert load_state(root)["s1"]["last_ckpt"] == 47000
+
+
+def test_load_transcript_keeps_unicode_line_separators():
+    p = Path(tempfile.mkdtemp()) / "t.jsonl"
+    _append(p, _user("앞 뒤"), _user("가\u0085나"), ensure_ascii=False)
+    assert [e["message"]["content"] for e in load_transcript(str(p))] == ["앞 뒤", "가\u0085나"]
+
+
+def test_stop_first_sight_logs_only_last_turn():
+    root = _project()
+    t = root / "t.jsonl"
+    _append(t, dict(_user("예전요청"), uuid="1"), dict(_assistant("답", usage=USAGE), uuid="2"),
+            dict(_user("지금요청"), uuid="3"), dict(_assistant("답", usage=USAGE), uuid="4"))
+    _capture(on_stop, {"cwd": str(root), "session_id": "s", "transcript_path": str(t)})
+    text = _log_text(root)
+    assert "지금요청" in text and "예전요청" not in text
+
+
+def test_stop_broken_state_does_not_relog_earlier_turns():
+    root = _project()
+    _stop(root, 47000, prompt="기록된요청")
+    (root / ".leneu-session" / ".state.json").write_text("{broken")
+    _stop(root, 47000, prompt="새요청")
+    text = _log_text(root)
+    assert text.count("기록된요청") == 1 and text.count("새요청") == 1
+
+
+def test_reenable_does_not_log_turns_from_while_off():
+    root = _project()
+    _stop(root, 47000, prompt="켜진때")
+    cli_stop(str(root))
+    _stop(root, 47000, prompt="비공개요청")
+    cli_init(str(root))
+    _stop(root, 47000, prompt="다시켠뒤")
+    text = _log_text(root)
+    assert "비공개요청" not in text and "다시켠뒤" in text and text.count("켜진때") == 1
+
+
+def test_parse_turns_records_slash_commands():
+    cmd = "<command-message>deploy</command-message>\n<command-name>/deploy</command-name>\n<command-args>production now</command-args>"
+    turns = parse_turns([_user(cmd), _user("펼친 본문", isMeta=True), _assistant("배포함")])
+    assert [(t["prompt"], t["reply"]) for t in turns] == [("/deploy production now", "배포함")]
+
+
+def test_parse_turns_drops_local_commands_without_reply():
+    turns = parse_turns([
+        _user("<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"),
+        _user("<local-command-stdout></local-command-stdout>"),
+        _user("."), _assistant("이어감"),
+    ])
+    assert [t["prompt"] for t in turns] == ["."]
+
+
+def test_parse_turns_keeps_quoted_command_tag_in_real_prompt():
+    turns = parse_turns([_user("이 태그 <command-name>/x</command-name> 왜 생겨?")])
+    assert len(turns) == 1 and "왜 생겨" in turns[0]["prompt"]
+
+
+def test_session_start_recovers_unmoved_pending():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    pending = root / ".leneu-session" / ".pending-checkpoint.md"
+    pending.write_text("### 다음 액션\n미이동표식\n")
+    when = datetime(2026, 11, 9, 14, 40, 30)
+    os.utime(pending, (when.timestamp(), when.timestamp()))
+    out = _capture(on_session_start, {"cwd": str(root), "source": "clear"})
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "미이동표식" in ctx and "체크포인트 본문표식" not in ctx
+    assert not pending.exists()
+    text = _log_text(root)
+    assert "## 2026-11-09 14:40 checkpoint" in text and "None" not in text
+
+
+def test_bad_log_header_is_skipped():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT + "\n## 2026-13-45 10:00 turn\n깨진헤더\n")
+    assert "체크포인트 본문표식" in build_context(root, "clear", NOW)
+
+
+def test_session_start_reports_failure_immediately():
+    root = _project()
+    log_error(root, ValueError("예전오류"))
+    old, globals()["build_context"] = build_context, lambda *a: 1 / 0
+    try:
+        out = _capture(on_session_start, {"cwd": str(root), "source": "clear"})
+    finally:
+        globals()["build_context"] = old
+    assert "2" in out["systemMessage"] and "ZeroDivisionError" in out["systemMessage"]
+
+
+def test_build_context_long_checkpoint_keeps_next_action():
+    root = _project()
+    body = "앞머리표식 " + "가" * 9000 + "\n### 다음 액션\n꼬리표식\n"
+    _write_log(root, "2026-11-09", CKPT.replace("### 다음 액션\n체크포인트 본문표식\n", body) + TURN)
+    c = build_context(root, "clear", NOW)
+    assert "앞머리표식" in c and "꼬리표식" in c and "중략" in c and "이후 턴표식" in c
+    assert len(c) <= 8000 + 1000
+    assert "6000자" in checkpoint_reason(root, False)
+
+
+def test_render_turn_keeps_end_of_reply():
+    out = render_turn({"prompt": "p", "reply": "서두 " * 400 + "최종결과", "tools": [], "files": []}, NOW)
+    res = next(l for l in out.splitlines() if l.startswith("**결과:**"))
+    assert res.endswith("최종결과") and len(res) <= 610
 
 
 def selftest():
