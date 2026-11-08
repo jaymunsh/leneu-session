@@ -3,11 +3,13 @@
 
 자기검증: python3 session_hook.py --selftest
 """
+import io
 import json
 import os
 import re
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from pathlib import Path
 DIR = ".leneu-session"
 DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 10}
 MAX_SESSIONS = 20
+PENDING = ".pending-checkpoint.md"
 USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 SYSTEM_TAG = re.compile(
@@ -178,7 +181,95 @@ def append_log(root, text, now):
     return path
 
 
-HANDLERS = {}
+def decide_checkpoint(cfg, sess, tokens):
+    window = cfg["context_window"]
+    if tokens - sess["last_ckpt"] < window * cfg["checkpoint_every_pct"] / 100:
+        return "none"
+    return "checkpoint+clear" if tokens >= window * cfg["clear_recommend_pct"] / 100 else "checkpoint"
+
+
+def checkpoint_reason(root, recommend_clear):
+    path = root / DIR / PENDING
+    lines = [
+        "leneu-session 체크포인트 시점입니다. 다른 작업을 시작하지 말고 아래 파일 하나만 Write로 작성하세요.",
+        f"파일: {path}",
+        "다음 세션이 이 파일만 읽고 이어갈 수 있게, 줄거리가 아니라 행동에 필요한 것만 씁니다. "
+        "비밀값은 적지 마세요. 헤더는 ###만 씁니다. 해당 없는 항목은 뺍니다.",
+        "### 현재 작업의 요구와 사용자 정정 (원문) — 요약하지 말고 원문 그대로. 이전 체크포인트의 원문도 이어 적고, 새 작업으로 넘어갔다면 이전 작업의 요구는 뺀다",
+        "### 확인된 사실 (경로·명령·값·에러)",
+        "### 변경 파일과 검증 여부",
+        "### 결정 (고른 것, 버린 것, 이유)",
+        "### 막다른 길 (시도했다 실패한 것과 이유)",
+        "### 다음 액션 (1~3개, 파일 경로 포함)",
+        "작성 후 '체크포인트 저장'이라고 한 줄만 답하세요.",
+    ]
+    if recommend_clear:
+        lines.append("그 줄 뒤에 '컨텍스트가 커졌습니다. 작업이 일단락되면 /clear를 권합니다.'를 덧붙이세요.")
+    return "\n".join(lines)
+
+
+def consume_pending(root, tokens, session_id, transcript_path, now):
+    """모델이 쓴 임시 파일을 로그로 옮긴다. 헤더와 시각은 훅이 붙인다."""
+    pending = root / DIR / PENDING
+    if not pending.exists():
+        return False
+    body = pending.read_text(errors="replace").strip()
+    if body:
+        body = mask_secrets(re.sub(r"^#{1,2} ", "### ", body, flags=re.M))
+        append_log(root, (
+            f"\n## {now:%Y-%m-%d %H:%M} checkpoint tokens={tokens or '?'} session={session_id[:8]}\n"
+            f"**원본:** {transcript_path}\n{body}\n"
+        ), now)
+    pending.unlink()
+    return bool(body)
+
+
+def _after_cursor(entries, cursor):
+    if cursor:
+        for i, e in enumerate(entries):
+            if e.get("uuid") == cursor:
+                return entries[i + 1:]
+    return entries
+
+
+def on_stop(data):
+    root = find_root(data.get("cwd"))
+    if root is None:
+        return
+    now = datetime.now()
+    sid = data.get("session_id") or "?"
+    transcript = data.get("transcript_path") or ""
+    active = bool(data.get("stop_hook_active"))
+    entries = load_transcript(transcript)
+
+    state = load_state(root)
+    sess = state.pop(sid, {})
+    state[sid] = sess  # 최근 사용한 세션을 뒤로 보내 오래된 것부터 지워지게 한다
+
+    if not active:
+        for turn in parse_turns(_after_cursor(entries, sess.get("cursor"))):
+            append_log(root, render_turn(turn, now), now)
+    if entries and entries[-1].get("uuid"):
+        sess["cursor"] = entries[-1]["uuid"]
+
+    tokens = context_tokens(entries)
+    consume_pending(root, tokens, sid, transcript, now)
+
+    output = None
+    if tokens is not None:
+        if "last_ckpt" not in sess or tokens < sess["last_ckpt"]:  # 첫 측정 또는 압축 직후
+            sess["baseline"] = sess["last_ckpt"] = tokens
+        elif not active:
+            action = decide_checkpoint(load_config(root), sess, tokens)
+            if action != "none":
+                sess["last_ckpt"] = tokens
+                output = {"decision": "block", "reason": checkpoint_reason(root, action == "checkpoint+clear")}
+    save_state(root, state)
+    if output:
+        print(json.dumps(output, ensure_ascii=False))
+
+
+HANDLERS = {"Stop": on_stop}
 
 
 def main():
@@ -399,6 +490,164 @@ def test_load_transcript_skips_broken_lines():
     p.write_text('{"type":"user"}\n{broken\n\n[1]\n')
     assert load_transcript(str(p)) == [{"type": "user"}]
     assert load_transcript("") == [] and load_transcript("/nonexistent") == []
+
+
+CFG = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 10}
+
+
+def _capture(fn, *args):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn(*args)
+    return json.loads(buf.getvalue()) if buf.getvalue().strip() else None
+
+
+def _stop(root, tokens, active=False, sid="s1", prompt="요청"):
+    """토큰 수가 tokens인 transcript로 Stop 훅을 한 번 돌린다."""
+    t = root / f"t-{sid}.jsonl"
+    usage = {"input_tokens": tokens} if tokens else None
+    n = sum(1 for _ in t.open()) if t.exists() else 0
+    with t.open("a") as f:
+        f.write(json.dumps(dict(_user(prompt), uuid=f"u{n}")) + "\n")
+        f.write(json.dumps(dict(_assistant("답", usage=usage), uuid=f"a{n}")) + "\n")
+    return _capture(on_stop, {"cwd": str(root), "session_id": sid, "transcript_path": str(t),
+                              "stop_hook_active": active, "hook_event_name": "Stop"})
+
+
+def _log_text(root):
+    return "".join(p.read_text() for p in sorted((root / ".leneu-session" / "logs").glob("*.md")))
+
+
+def test_decide_checkpoint_threshold():
+    assert decide_checkpoint(CFG, {"last_ckpt": 47000}, 146999) == "none"
+    assert decide_checkpoint(CFG, {"last_ckpt": 47000}, 147000) == "checkpoint"
+
+
+def test_decide_checkpoint_recommends_clear_past_limit():
+    assert decide_checkpoint(CFG, {"last_ckpt": 247000}, 347000) == "checkpoint+clear"
+    assert decide_checkpoint(CFG, {"last_ckpt": 299000}, 299500) == "none"  # 넘어도 간격 전이면 조용히
+
+
+def test_checkpoint_reason_contents():
+    root = _project()
+    r = checkpoint_reason(root, True)
+    for h in ["현재 작업의 요구와 사용자 정정", "확인된 사실", "변경 파일과 검증 여부", "결정", "막다른 길", "다음 액션"]:
+        assert h in r, h
+    assert str(root / ".leneu-session" / ".pending-checkpoint.md") in r
+    assert "/clear" in r and "비밀값" in r
+    assert "/clear" not in checkpoint_reason(root, False)
+
+
+def test_stop_first_measure_sets_baseline_without_block():
+    root = _project()
+    assert _stop(root, 47000) is None
+    sess = load_state(root)["s1"]
+    assert sess["baseline"] == 47000 and sess["last_ckpt"] == 47000
+
+
+def test_stop_blocks_once_per_interval():
+    root = _project()
+    _stop(root, 47000)
+    assert _stop(root, 146999) is None
+    out = _stop(root, 147000)
+    assert out["decision"] == "block" and ".pending-checkpoint.md" in out["reason"]
+    assert "/clear" not in out["reason"]
+    assert _stop(root, 148000) is None  # 다음 턴에 또 재촉하지 않는다
+
+
+def test_stop_recommends_clear_at_limit():
+    root = _project()
+    _stop(root, 250000)
+    assert "/clear" in _stop(root, 350000)["reason"]
+
+
+def test_stop_hook_active_never_blocks():
+    root = _project()
+    _stop(root, 47000)
+    assert _stop(root, 900000, active=True) is None
+    assert load_state(root)["s1"]["last_ckpt"] == 47000
+
+
+def test_stop_resets_after_compaction():
+    root = _project()
+    _stop(root, 300000)
+    assert _stop(root, 50000) is None
+    sess = load_state(root)["s1"]
+    assert sess["baseline"] == 50000 and sess["last_ckpt"] == 50000
+
+
+def test_stop_records_all_new_turns_once():
+    root = _project()
+    t = root / "t.jsonl"
+    entries = [dict(_user("첫째"), uuid="1"), dict(_assistant("답1", usage=USAGE), uuid="2"),
+               dict(_user("둘째"), uuid="3"), dict(_assistant("답2", usage=USAGE), uuid="4")]
+    t.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    data = {"cwd": str(root), "session_id": "s", "transcript_path": str(t)}
+    _capture(on_stop, data)
+    _capture(on_stop, data)
+    text = _log_text(root)
+    assert text.count("첫째") == 1 and text.count("둘째") == 1
+
+
+def test_stop_active_does_not_record_turn():
+    root = _project()
+    _stop(root, 47000, prompt="기록됨")
+    _stop(root, 47000, active=True, prompt="체크포인트지시")
+    text = _log_text(root)
+    assert "기록됨" in text and "체크포인트지시" not in text
+
+
+def test_stop_without_usage_records_turn_without_block():
+    root = _project()
+    assert _stop(root, None, prompt="사용량없음") is None
+    assert "사용량없음" in _log_text(root)
+
+
+def test_stop_uninitialized_project_creates_nothing():
+    d = Path(tempfile.mkdtemp()).resolve()
+    (d / ".git").mkdir()
+    assert _stop(d, 500000) is None
+    assert not (d / ".leneu-session").exists()
+
+
+def test_consume_pending_moves_to_log_once():
+    root = _project()
+    pending = root / ".leneu-session" / ".pending-checkpoint.md"
+    pending.write_text("### 다음 액션\n1. 일\n")
+    now = datetime(2026, 11, 9, 14, 15)
+    assert consume_pending(root, 147000, "6f74a221-xxxx", "/tmp/t.jsonl", now) is True
+    assert not pending.exists()
+    assert consume_pending(root, 147000, "6f74a221-xxxx", "/tmp/t.jsonl", now) is False
+    text = _log_text(root)
+    assert "## 2026-11-09 14:15 checkpoint tokens=147000 session=6f74a221\n" in text
+    assert "**원본:** /tmp/t.jsonl" in text and text.count("1. 일") == 1
+
+
+def test_consume_pending_demotes_headers_and_masks():
+    root = _project()
+    pending = root / ".leneu-session" / ".pending-checkpoint.md"
+    pending.write_text("## 제목\n# 큰제목\n### 유지\nsk-ant-abc123def456ghi\n")
+    consume_pending(root, 1, "s", "t", datetime(2026, 11, 9))
+    text = _log_text(root)
+    body = text.split("**원본:** t\n")[1]
+    assert "\n## " not in "\n" + body and "\n# " not in "\n" + body
+    assert "### 제목" in body and "### 큰제목" in body and "### 유지" in body
+    assert "sk-ant" not in body
+
+
+def test_consume_pending_empty_is_discarded():
+    root = _project()
+    pending = root / ".leneu-session" / ".pending-checkpoint.md"
+    pending.write_text("  \n")
+    assert consume_pending(root, 1, "s", "t", datetime(2026, 11, 9)) is False
+    assert not pending.exists() and _log_text(root) == ""
+
+
+def test_stop_moves_leftover_pending_from_crash():
+    root = _project()
+    (root / ".leneu-session" / ".pending-checkpoint.md").write_text("### 다음 액션\n남은 것\n")
+    _stop(root, 47000)
+    assert _log_text(root).count("남은 것") == 1
 
 
 def selftest():
