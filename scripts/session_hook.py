@@ -9,6 +9,8 @@ import os
 import re
 import sys
 import tempfile
+import threading
+import time
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,7 @@ DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_ev
 MAX_SESSIONS = 20
 PENDING = ".pending-checkpoint.md"
 MAX_INJECT = 8000
+FLUSH_WAIT = 2.0
 HEADER = re.compile(r"^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (turn|checkpoint|compact)\b.*$", re.M)
 USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
@@ -99,6 +102,28 @@ def load_transcript(path):
         if isinstance(e, dict):
             out.append(e)
     return out
+
+
+def _last_main_text(entries):
+    for e in reversed(entries):
+        if e.get("type") == "assistant" and not e.get("isSidechain"):
+            text = _text(e.get("message", {}).get("content")).strip()
+            if text:
+                return text
+    return None
+
+
+def load_settled(path, message, wait=None):
+    """Stop 시점에 마지막 응답이 아직 transcript에 안 쓰였을 수 있어 잠깐 기다린다.
+    늦게 읽으면 토큰 수가 한 턴 밀리고 결과가 비어서 기록된다."""
+    entries = load_transcript(path)
+    if not message:
+        return entries
+    deadline = time.monotonic() + (FLUSH_WAIT if wait is None else wait)
+    while _last_main_text(entries) != message.strip() and time.monotonic() < deadline:
+        time.sleep(0.05)
+        entries = load_transcript(path)
+    return entries
 
 
 def context_tokens(entries):
@@ -242,17 +267,23 @@ def on_stop(data):
     sid = data.get("session_id") or "?"
     transcript = data.get("transcript_path") or ""
     active = bool(data.get("stop_hook_active"))
-    entries = load_transcript(transcript)
+    message = data.get("last_assistant_message")
+    entries = load_settled(transcript, message)
 
     state = load_state(root)
     sess = state.pop(sid, {})
     state[sid] = sess  # 최근 사용한 세션을 뒤로 보내 오래된 것부터 지워지게 한다
 
     if not active:
-        for turn in parse_turns(_after_cursor(entries, sess.get("cursor"))):
+        turns = parse_turns(_after_cursor(entries, sess.get("cursor")))
+        if turns and message and message.strip() not in turns[-1]["reply"]:
+            turns[-1]["reply"] = (turns[-1]["reply"] + "\n\n" + message.strip()).strip()
+        for turn in turns:
             append_log(root, render_turn(turn, now), now)
-    if entries and entries[-1].get("uuid"):
-        sess["cursor"] = entries[-1]["uuid"]
+    for e in reversed(entries):  # 끝에는 uuid 없는 메타 항목이 올 수 있다
+        if e.get("uuid"):
+            sess["cursor"] = e["uuid"]
+            break
 
     tokens = context_tokens(entries)
     consume_pending(root, tokens, sid, transcript, now)
@@ -794,6 +825,49 @@ def test_stop_moves_leftover_pending_from_crash():
     (root / ".leneu-session" / ".pending-checkpoint.md").write_text("### 다음 액션\n남은 것\n")
     _stop(root, 47000)
     assert _log_text(root).count("남은 것") == 1
+
+
+def test_load_settled_waits_for_late_flush():
+    p = Path(tempfile.mkdtemp()) / "t.jsonl"
+    p.write_text(json.dumps(_user("요청")) + "\n")
+
+    def flush():
+        with p.open("a") as f:
+            f.write(json.dumps(_assistant("늦은 답", usage=USAGE)) + "\n")
+
+    threading.Timer(0.2, flush).start()
+    assert context_tokens(load_settled(str(p), "늦은 답")) == 79000
+
+
+def test_load_settled_gives_up_and_no_wait_without_message():
+    p = Path(tempfile.mkdtemp()) / "t.jsonl"
+    p.write_text(json.dumps(_user("요청")) + "\n")
+    start = time.monotonic()
+    assert len(load_settled(str(p), None)) == 1
+    assert time.monotonic() - start < 0.2
+    assert len(load_settled(str(p), "안 옴", wait=0.2)) == 1
+
+
+def test_stop_late_flush_keeps_reply_without_duplicates():
+    """Stop 시점에 응답이 아직 안 쓰였어도 결과가 남고, 다음 턴에 중복되지 않는다."""
+    root = _project()
+    t = root / "t.jsonl"
+    meta = {"type": "last-prompt"}  # uuid 없는 항목이 끝에 와도 커서가 유지되어야 한다
+    t.write_text(json.dumps(dict(_user("첫째"), uuid="1")) + "\n" + json.dumps(meta) + "\n")
+    data = {"cwd": str(root), "session_id": "s", "transcript_path": str(t), "last_assistant_message": "첫 답"}
+    old, globals()["FLUSH_WAIT"] = FLUSH_WAIT, 0.1
+    try:
+        _capture(on_stop, data)
+        with t.open("a") as f:
+            f.write(json.dumps(dict(_assistant("첫 답", usage=USAGE), uuid="2")) + "\n")
+            f.write(json.dumps(dict(_user("둘째"), uuid="3")) + "\n")
+            f.write(json.dumps(dict(_assistant("둘째 답", usage=USAGE), uuid="4")) + "\n")
+        _capture(on_stop, dict(data, last_assistant_message="둘째 답"))
+    finally:
+        globals()["FLUSH_WAIT"] = old
+    text = _log_text(root)
+    assert text.count("**요청:** 첫째") == 1, text
+    assert "**결과:** 첫 답" in text and "**요청:** 둘째" in text and "둘째 답" in text
 
 
 def _write_log(root, date, text):
