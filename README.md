@@ -1,86 +1,298 @@
 # leneu-session
 
-긴 작업이 세션을 넘어가도 끊기지 않게 하는 Claude Code 플러그인입니다. 일정 작업량마다 체크포인트를 자동으로 남기고, `/clear` 후 하던 일을 바로 잇습니다.
+Keep long Claude Code work moving across `/clear`, without writing handoffs by hand.
 
-## 사용 흐름
+한국어 문서: [README-ko.md](README-ko.md)
+
+Long tasks outlive a single context window. Waiting for auto-compact means summarizing at the moment you have the most to lose, and writing a handoff yourself means remembering to do it. This plugin does the bookkeeping while you work: it records every turn, saves a structured checkpoint at regular intervals, and restores the latest one when you run `/clear`.
 
 ```
-/leneu-init            이 프로젝트에서 켠다 (프로젝트마다 한 번)
-... 평소대로 작업 ...    턴은 자동 기록되고, 체크포인트가 자동으로 쌓인다
-"/clear를 권합니다"      작업이 일단락되면 직접 /clear 를 친다
-.                      아무거나 짧게 입력하면 이어서 진행한다
+/leneu-init                        once per project
+  ... work as usual ...            turns and checkpoints are recorded for you
+"/clear is recommended"            the plugin suggests it, you decide when
+/clear
+.                                  any short input, and work continues
 ```
 
-`/clear` 를 언제 치든 괜찮습니다. 권고가 뜨기 전이라도 작업 하나가 끝났을 때가 가장 좋은 시점입니다.
+> **Status: 0.1.0, early.** The hooks, checkpoints and resume logic are covered by a self-test and were exercised against real `claude -p` runs. The full interactive flow (`/clear`, then `.`) has not yet had a long real-world trial, so please report anything odd.
 
-## 명령어
+## Contents
 
-| 명령 | 하는 일 |
-|---|---|
-| `/leneu-init` | 켠다. 꺼 둔 프로젝트는 기록을 유지한 채 다시 켠다 |
-| `/leneu-stop` | 끈다. 기록은 지우지 않는다 |
-| `/leneu-handoff [초점]` | 인계 문서를 쓰고 이어갈 프롬프트를 준다. 다른 에이전트나 훅이 꺼진 환경에서도 쓸 수 있다 |
-| `/leneu-brief [--test]` | 프로젝트 전체를 다른 프로젝트·에이전트에게 설명하는 문서를 쓴다 |
+- [Install](#install)
+- [The flow in detail](#the-flow-in-detail)
+- [Commands](#commands)
+- [Configuration](#configuration)
+- [What gets created](#what-gets-created)
+- [How it works](#how-it-works)
+- [Safety and privacy](#safety-and-privacy)
+- [Known limitations](#known-limitations)
+- [Coming from jay-session](#coming-from-jay-session)
+- [Turning things off](#turning-things-off)
+- [Development](#development)
 
-복귀, 로그 검색, 수동 기록은 말로 하면 됩니다. "지난번에 이거 어떻게 고쳤지", "이건 남겨줘".
-
-## 설치
+## Install
 
 ```bash
-claude plugin marketplace add /Users/sunghyuk/Documents/Service/leneu-session
+claude plugin marketplace add jaymunsh/leneu-session
 claude plugin install leneu-session@leneu-session
 ```
 
-jay-session과 함께 켜 두면 훅이 겹치므로 비활성화합니다. 기존 `.claude/session/` 기록은 옮기지 않고 그대로 남습니다.
+Then run `/reload-plugins`, since commands and hooks are loaded at that point and `/clear` does not reload them. You install it once, not per repository. It requires `python3` (3.8 or newer) and has no other dependencies.
+
+To update later:
 
 ```bash
-claude plugin disable jay-session@jay-claude
+claude plugin marketplace update leneu-session
+claude plugin update leneu-session@leneu-session
 ```
 
-설치 없이 시험하려면 `claude --plugin-dir /Users/sunghyuk/Documents/Service/leneu-session`.
+The first line refreshes the cloned repository and the second refreshes what is installed. Run both, then `/reload-plugins`.
 
-## 설정
+To try it without installing:
 
-`.leneu-session/config.json` (선택). 없으면 기본값을 씁니다.
+```bash
+git clone https://github.com/jaymunsh/leneu-session.git
+claude --plugin-dir ./leneu-session
+```
 
-| 키 | 기본값 | 뜻 |
+If a short name such as `/leneu-init` isn't recognized, use the full form: `/leneu-session:leneu-init`.
+
+## The flow in detail
+
+```
+── Session 1 ──────────────────────────────────────────
+  > /leneu-init                 turn it on for this project
+
+  (you work)                    each turn is appended to today's log
+
+  ~100K tokens of new context   Claude writes a checkpoint in one short
+                                extra turn and replies "체크포인트 저장"
+                                ("checkpoint saved")
+
+  past 30% of the window        the checkpoint reply also recommends /clear
+
+  > /clear                      you type this, at a point that suits you
+
+── Session 2 ──────────────────────────────────────────
+  (the latest checkpoint and every turn after it
+   are already in context)
+
+  > .                           Claude checks the repository still matches,
+                                then carries on with the next action
+```
+
+**You can run `/clear` whenever you like.** The recommendation is only a prompt. The end of a task is the best time, even if no recommendation has appeared.
+
+**What you still do yourself:** type `/clear`, and send one message afterwards. No hook can clear a session, and a new session waits for input before Claude responds. If your message is unrelated to the earlier work, Claude ignores the restored record.
+
+### What a checkpoint contains
+
+Checkpoints list what the next session needs to act, not a story of what happened. Claude writes these sections, skips any that don't apply, and keeps the total under 6,000 characters:
+
+- The current task's requirements and your corrections, **quoted verbatim**
+- Confirmed facts: paths, commands, values, errors
+- Changed files and whether they were verified
+- Decisions: what was chosen, what was rejected, and why
+- Dead ends: what was tried and why it failed
+- Next actions: one to three, with file paths
+
+Dead ends matter most. `git log` tells the next session what changed, but only this record tells it which approach was abandoned.
+
+### What happens on each kind of session start
+
+| Start | What Claude receives |
+|---|---|
+| `/clear` | The latest checkpoint or handoff, plus the turns after it |
+| New session | The same, with its age. If it's over 24 hours old, Claude asks whether to continue before acting on it |
+| After compaction | Only the location of the record, since the compaction summary is already there and work is still in progress |
+| Resume or fork | Nothing, since the conversation is already present |
+| `claude -p` | Nothing. Turns are still logged, but no checkpoints are requested |
+
+Injected text is capped at 8,000 characters. An oversized checkpoint keeps its beginning and end, because the next actions come last, and gets a note pointing to the full record.
+
+### Asking about past work
+
+No command is needed. The bundled skill handles these:
+
+- *"How did we fix that timeout last week?"* searches the logs.
+- *"What did I get done this week?"* summarizes by topic.
+- *"Log this one"* adds a manual entry for something the hook can't see, such as a reason or a constraint.
+- *"Where did I leave off?"* finds the latest record, checks it against the repository, and briefs you.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/leneu-init` | Turns the plugin on for this project. Re-enables a stopped project and keeps its records. |
+| `/leneu-stop` | Turns it off. Records are kept. |
+| `/leneu-handoff [focus]` | Writes a handoff now and gives you a prompt to paste. |
+| `/leneu-brief [--test]` | Writes a document explaining the whole project to an outside reader. |
+
+### `/leneu-handoff`: a manual handoff
+
+Checkpoints are automatic, so you only need this when you want a record right now, or when you're continuing somewhere the hooks aren't running, such as another agent or machine. The final output is one line, with an absolute path:
+
+```
+/Users/me/projects/foo/.leneu-session/handoffs/handoff-20261109-1430.md 읽고 검증한 뒤 이어서 진행해줘.
+```
+
+(The prompt is Korean for "read this, verify it, and continue.") You can narrow it with an argument: `/leneu-handoff auth refactor only`. A new handoff also resets the checkpoint interval, so you won't get a duplicate checkpoint right after it. Running it in a project that was never initialized creates the folder but leaves automatic recording off.
+
+### `/leneu-brief`: explaining the project to someone else
+
+`/leneu-handoff` passes on *the work in progress*. `/leneu-brief` explains *the project itself* to a reader who has never opened the repository, and writes `.leneu-session/project-brief.md`.
+
+- **It stands alone.** The reader may not have the repository, so it doesn't rely on pointers like "see the README".
+- **It labels its evidence.** Each claim is marked `[실행]` (ran it), `[코드]` (read the code) or `[기록]` (from logs or conversation), so a guess doesn't get passed along as fact.
+- **It uses your history.** Decisions and dead ends come from the logs and handoffs, then get checked against the repository. A decision that has since been reversed is recorded as "it used to be this, now it's that".
+- **It updates in place.** Later runs read only what changed since the recorded commit. Architecture decisions and pitfalls are always carried forward, because they can't be recovered from the repository.
+- **`--test` checks for gaps.** A subagent reads only the brief, tries to answer how to run the project and where to start, and any gaps get filled in. This costs extra tokens, so it's off by default.
+
+## Configuration
+
+Create `.leneu-session/config.json` if you need to. Every key is optional, and invalid values fall back to the defaults.
+
+| Key | Default | Meaning |
 |---|---|---|
-| `context_window` | `1000000` | 컨텍스트 창 크기. **자동 감지가 안 됩니다** |
-| `clear_recommend_pct` | `30` | 이 비율을 넘긴 체크포인트에서 `/clear` 를 권한다 |
-| `checkpoint_every_pct` | `10` | 컨텍스트가 이 비율만큼 늘 때마다 체크포인트를 남긴다 |
+| `context_window` | `1000000` | Context window size in tokens. **It can't be detected automatically.** |
+| `clear_recommend_pct` | `30` | Recommend `/clear` at the first checkpoint past this percentage of the window. |
+| `checkpoint_every_pct` | `10` | Request a checkpoint each time context grows by this percentage of the window. |
 
-1M 기본값에서는 약 100K마다 체크포인트가 쌓이고 권고는 300K를 넘긴 첫 체크포인트(시작 토큰이 47K면 약 347K)에서 뜹니다. 200K 창을 쓰는 프로젝트는 아래처럼 바꾸세요. 그대로 두면 권고 전에 auto-compact가 먼저 일어날 수 있습니다.
+With the defaults, a checkpoint is requested about every 100K tokens. The recommendation appears at the first checkpoint past 300K, which is around 347K if the session started at 47K.
+
+**If you use a 200K window, change this.** Otherwise auto-compact may fire before any recommendation appears:
 
 ```json
 {"context_window": 200000, "clear_recommend_pct": 45}
 ```
 
-## 저장 위치
+### Why these defaults
+
+Checkpoints are written at intervals because the record has to exist *before* something goes wrong, and an interrupted session may never get another chance. They're written by the session already running because it holds the full context and reads it from the prompt cache, at roughly a tenth of the input cost of starting a separate one.
+
+## What gets created
+
+Nothing until you run a command that needs it.
 
 ```
-.leneu-session/
-├── .gitignore         # 내용은 *. 폴더 전체가 git에서 제외된다
-├── logs/YYYY-MM-DD.md # 턴 기록과 체크포인트. 삽입만 하며 영구 보존
-├── handoffs/          # /leneu-handoff 문서. 최근 10개 유지
-├── project-brief.md   # /leneu-brief 문서
-├── config.json        # 선택
-├── hook-errors.log    # 훅 오류. 다음 세션 시작 때 알려 준다
-└── disabled           # /leneu-stop 표시
+<your project>/.leneu-session/
+├── .gitignore              # contains *, so the whole folder stays out of git
+├── logs/YYYY-MM-DD.md      # turns and checkpoints, append-only, kept forever
+├── handoffs/handoff-*.md   # from /leneu-handoff, newest 10 kept
+├── project-brief.md        # from /leneu-brief, updated in place
+├── config.json             # optional
+├── hook-errors.log         # hook failures, reported at next session start
+├── hook-errors.old.log     # failures already reported
+├── disabled                # present while /leneu-stop is in effect
+├── .state.json             # read position and token baseline per session
+└── .pending-checkpoint.md  # brief stop for a checkpoint on its way to the log
 ```
 
-## 알려진 한계
+A log looks like this, with its labels in Korean (`요청` request, `결과` result, `변경` changed, `도구` tools):
 
-- **`/clear` 는 수동입니다.** 훅으로 실행할 수단이 없습니다.
-- **복귀 시 입력이 한 번 필요합니다.** `.` 같은 입력으로 시작합니다.
-- **동시 세션을 구분하지 않습니다.** 같은 폴더를 터미널 여러 개로 동시에 열면 `/clear` 가 다른 터미널의 체크포인트를 읽을 수 있습니다. 복귀 시 저장소 상태를 확인하도록 안내해 완화합니다. 서브에이전트와 worktree는 영향이 없습니다.
-- **비밀값 마스킹은 흔한 패턴만 가립니다.** 프롬프트에 붙여넣은 비밀번호처럼 형식 없는 값은 로그에 남습니다. 폴더는 기본적으로 git에서 제외됩니다.
-- **비대화형 판별은 문서화되지 않은 값에 의존합니다.** `CLAUDE_CODE_ENTRYPOINT`(`claude -p` 는 `sdk-cli`)를 보며 값이 없으면 대화형으로 취급합니다.
-- **체크포인트마다 짧은 턴이 하나 추가되어** 토큰이 조금 들고 화면에도 보입니다. 간격은 `checkpoint_every_pct` 로 조정합니다.
+```markdown
+## 2026-11-09 14:02 turn
+**요청:** Fix the bug in add()
+**결과:** Changed the subtraction to addition. Tests pass.
+**변경:** /path/to/calc.py
+**도구:** Read, Edit, Bash
 
-## 개발
+## 2026-11-09 14:15 checkpoint tokens=147000 session=6f74a221
+**원본:** /path/to/transcript.jsonl
+### 다음 액션
+1. ...
+```
+
+Logs split by day and are never rewritten. Each turn keeps up to 400 characters of the request and the last 600 of the result, because conclusions come at the end. The `**원본:**` line points to the full transcript if you need more.
+
+## How it works
+
+One Python script, four hooks.
+
+| Hook | Fires when | What it does |
+|---|---|---|
+| `Stop` | Each turn ends | Logs new turns, moves a finished checkpoint into the log, and asks for a new checkpoint when one is due |
+| `SessionStart` | A session starts | Recovers a checkpoint left behind by an interrupted session, injects the context from the table above, reports hook errors, and enables new git worktrees |
+| `PreToolUse` (`Write`) | Before a file write | Auto-approves only the plugin's own checkpoint and handoff files |
+| `PreCompact` | Before compaction | Notes where the uncompacted transcript lives |
+
+Some design decisions worth knowing:
+
+- **Context size comes from the transcript.** Hooks aren't told the context percentage, so the script sums the last main response's `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens`. Subagent usage is excluded, and a drop in the total is treated as compaction.
+- **Checkpoints use `additionalContext`, not `decision: block`.** A block gets stored in the transcript as a hook error, and models then wrote about that "error" in their checkpoints.
+- **Two steps keep the log format safe.** Claude writes to a temporary file, and the hook adds the header and timestamp when moving it into the log. Any `#` or `##` headers in the body get demoted so they can't look like new log sections.
+- **Hooks never block your work.** Every failure is caught, logged and reported later, and the script always exits 0. A failed `/clear` restore is reported right away.
+- **A malformed transcript doesn't stop recording.** The read position is saved even when a step fails, so the same turns aren't logged repeatedly.
+- **If the read position is unknown, only the last turn is logged.** This covers a damaged state file, turning the plugin on mid-session, and forks. Logs can't be edited, so a missing turn is better than duplicated or unwanted ones.
+- **The script waits briefly for the transcript.** The last response may not be on disk when `Stop` fires, so it waits up to 2 seconds. Otherwise token counts lag by a turn and results come out empty.
+- **Git worktrees are handled for you.** The folder is gitignored and so missing from new worktrees. If the main checkout has the plugin on, a new worktree gets its own folder and a copy of the config. Worktrees don't share logs.
+- **The project is found by walking up from the working directory,** stopping at the nearest `.git` or your home folder.
+
+## Safety and privacy
+
+- **Off by default.** Nothing is recorded in a project until you run `/leneu-init`. It refuses to run in your home folder, where it would apply to every folder below it.
+- **Stays local.** The plugin sends nothing anywhere itself. The restored record does enter your Claude conversation as context.
+- **Excluded from git.** The folder contains its own `.gitignore`. Logs can quote your prompts and results, so keep it that way unless you mean to share them.
+- **Narrow auto-approval.** Only `.pending-checkpoint.md` and direct `handoff-*.md` children of `handoffs/` are approved, and paths are resolved first so symlinks can't point elsewhere. Your own deny and ask rules still apply.
+- **Limited secret masking.** Hook-written records mask common formats: `sk-…`, `ghp_…`, `github_pat_…`, `AKIA…`, `Bearer …` and `xoxb-`/`xoxp-…`. A password pasted without a recognizable format is not masked. Manual handoffs rely on an instruction to Claude not to include secrets.
+- **A committed `.leneu-session/` turns the plugin on.** The folder's presence is the switch, so a repository that commits it activates the plugin and has its contents injected, much like a `CLAUDE.md`.
+- **Your settings are untouched.** Hooks ship inside the plugin, and `settings.json` isn't changed.
+
+## Known limitations
+
+- **`/clear` is manual.** No hook can run it.
+- **Resuming takes one input.** A new session waits for you, so `.` or any short message is required.
+- **Checkpoints are visible and cost tokens.** Each one adds a short turn. Adjust `checkpoint_every_pct` if that's too frequent.
+- **Concurrent sessions aren't distinguished.** With the same folder open in several terminals, `/clear` may read another terminal's checkpoint. Checking the repository on resume reduces the risk. Subagents and worktrees aren't affected.
+- **`context_window` is manual.** The hook input doesn't include it.
+- **Non-interactive detection relies on an undocumented value.** `CLAUDE_CODE_ENTRYPOINT` is `sdk-cli` under `claude -p`. If it's missing, the session is treated as interactive.
+- **Interrupting and then clearing loses that turn.** `Stop` doesn't fire after Esc, so running `/clear` right after leaves the interrupted turn out of the log.
+- **Other agents aren't supported yet.** Claude Code comes first, with Codex and others possible later. `/leneu-handoff` already produces a plain file any agent can read.
+
+Skill and command instructions are written in Korean. Claude replies in whatever language you use, though some fixed lines and log labels stay Korean.
+
+## Coming from jay-session
+
+leneu-session succeeds [jay-session](https://github.com/jaymunsh/jay-claude).
+
+| | jay-session | leneu-session |
+|---|---|---|
+| Handoff | Manual `/jay-new` | Automatic checkpoints, with `/leneu-handoff` when you want one |
+| After `/clear` | Injects a path, then Claude reads the file | Injects the record and later turns directly |
+| `/clear` timing | Your call | A recommendation at a configurable threshold |
+| Log | Monthly `devlog.md` | Daily files, always part of the resume |
+| Location | `.claude/session/` | `.leneu-session/` |
+
+Disable jay-session when you switch, because running both means overlapping hooks. Existing `.claude/session/` files aren't migrated and stay where they are.
+
+```bash
+claude plugin disable jay-session@jay-claude
+```
+
+## Turning things off
+
+```
+/leneu-stop                 stop recording here and keep the records
+/leneu-init                 turn it back on
+```
+
+Turns made while it's off are never logged, including after you turn it back on. To delete everything for a project, remove its `.leneu-session/` folder. To remove the plugin:
+
+```bash
+claude plugin uninstall leneu-session@leneu-session
+```
+
+This removes the hooks and commands. Files already written to your projects stay.
+
+## Development
 
 ```bash
 python3 scripts/session_hook.py --selftest
+claude plugin validate .
 ```
 
-설계: `docs/superpowers/specs/2026-11-09-leneu-session-design.md`
+All the logic and its tests live in `scripts/session_hook.py`. The design is in [docs/superpowers/specs](docs/superpowers/specs/2026-11-09-leneu-session-design.md) and the implementation plan in [docs/superpowers/plans](docs/superpowers/plans/2026-11-09-leneu-session.md), both in Korean.
+
+## License
+
+MIT

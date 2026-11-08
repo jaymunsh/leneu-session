@@ -1,6 +1,8 @@
 {
   "name": "leneu-session",
-  "owner": {"name": "leneu"},
+  "owner": {
+    "name": "jaymunsh"
+  },
   "plugins": [
     {
       "name": "leneu-session",
