@@ -182,9 +182,14 @@ jay-session에서 이어받는 규칙: 먼저 쓰고 정말 모르는 것만 묻
 - `session_hook.py --selftest`: 토큰 계산, 턴 append와 커서, 간격 판단, `stop_hook_active` 처리, 압축 후 재설정, 체크포인트 찾기, source별 주입, `.leneu-session/` 없을 때 무동작, 상위 폴더 탐색과 `.git`에서의 멈춤, 임시 체크포인트의 로그 이동, worktree 자동 생성, handoff와 체크포인트 중 최신 선택, 자동 승인 경로의 경계(`..` 포함 경로 거부), 커서 이후 여러 턴 기록, 시스템 메시지 제외, 비밀값 마스킹, 오류 기록과 다음 세션 알림.
 - 실제 Claude Code에서 끝까지: 임시 프로젝트에서 `/leneu-init` → 작업으로 체크포인트 발생 확인(`checkpoint_every`를 낮춰 테스트) → `/clear` → 본문 주입과 이어가기 확인.
 
-## 구현 전에 확인할 것
+## 확인 결과 (2026-11-09)
 
-이번에 훅 문서는 일부만 원문으로 읽었고 Stop과 UserPromptSubmit 절은 요약으로 읽었다.
+- **Stop:** `{"decision":"block","reason":...}`로 계속 진행시킨다. 8회 연속 제한은 있으나 도구 호출로 초기화되고 체크포인트는 1회라 해당 없다. 문서상 `decision: block`은 transcript에 오류로 보일 수 있어, 표시 방식은 체감 검증에서 확인한다.
+- **PreToolUse:** `hookSpecificOutput.permissionDecision: "allow"`. 사용자의 deny/ask 규칙은 그대로 적용된다.
+- **SessionStart 자동 시작:** `initialUserMessage`는 `-p` 모드용으로만 문서화되어 있다. `.` 입력으로 간다.
+- **비대화형 구분:** 문서에 없다. 실측으로 `claude -p`는 `CLAUDE_CODE_ENTRYPOINT=sdk-cli`, 대화형은 `cli`다. 값이 없으면 대화형으로 취급한다.
+
+## 구현 전에 확인할 것 (작성 당시 메모)
 
 - Stop의 `decision`, `reason`, `stop_hook_active` 정확한 형식과, 8회 연속 제한의 동작.
 - SessionStart가 사용자 입력 없이 Claude를 먼저 시작하게 할 수 있는지. 없어도 사용자가 `.` 입력을 수용했으므로 설계는 그대로이며, `.`만 입력해도 주입된 작업을 이어가도록 안내 문구를 쓴다.

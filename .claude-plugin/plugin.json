@@ -1,0 +1,5 @@
+{
+  "name": "leneu-session",
+  "description": "일정 작업량마다 체크포인트를 자동으로 남기고, /clear 후 하던 일을 자동으로 잇는다.",
+  "version": "0.1.0"
+}
