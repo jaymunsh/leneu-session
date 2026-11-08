@@ -18,6 +18,8 @@ DIR = ".leneu-session"
 DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 10}
 MAX_SESSIONS = 20
 PENDING = ".pending-checkpoint.md"
+MAX_INJECT = 8000
+HEADER = re.compile(r"^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (turn|checkpoint|compact)\b.*$", re.M)
 USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 SYSTEM_TAG = re.compile(
@@ -269,7 +271,151 @@ def on_stop(data):
         print(json.dumps(output, ensure_ascii=False))
 
 
-HANDLERS = {"Stop": on_stop}
+def _sections(text):
+    """로그를 (시각, 종류, 본문)으로 나눈다. 헤더 형식이 아닌 줄은 앞 절에 붙는다."""
+    matches = list(HEADER.finditer(text))
+    for m, nxt in zip(matches, [*matches[1:], None]):
+        end = nxt.start() if nxt else len(text)
+        yield datetime.strptime(m.group(1), "%Y-%m-%d %H:%M"), m.group(2), text[m.start():end].strip()
+
+
+def _log_files(root):
+    return sorted((root / DIR / "logs").glob("*.md"))
+
+
+def latest_checkpoint(root):
+    for path in reversed(_log_files(root)):
+        found = [s for s in _sections(path.read_text(errors="replace")) if s[1] == "checkpoint"]
+        if found:
+            return found[-1][0], found[-1][2], path
+    return None
+
+
+def turns_after(root, since):
+    """같은 분에 쓰인 턴은 포함한다. 잃는 것보다 한 줄 겹치는 쪽이 낫다."""
+    files = _log_files(root)
+    if since is None:
+        files = files[-2:]  # 체크포인트가 없으면 최근 것만 본다
+    else:
+        files = [p for p in files if p.stem >= f"{since:%Y-%m-%d}"]
+    out = []
+    for path in files:
+        for dt, kind, body in _sections(path.read_text(errors="replace")):
+            if kind == "turn" and (since is None or dt >= since):
+                out.append(body)
+    return "\n\n".join(out)
+
+
+def build_context(root, source, now):
+    if source not in ("clear", "startup", "compact"):
+        return None
+    latest = latest_checkpoint(root)
+    if source == "compact":
+        if not latest:
+            return None
+        return (
+            "컨텍스트 압축 직후라 하던 작업이 그대로 이어지는 중입니다. 브리핑하거나 다시 묻지 말고 계속하세요. "
+            f"압축 요약에 빠진 것이 있을 때만 {latest[2]} 의 마지막 체크포인트를 보세요."
+        )
+    since, body, path = latest or (None, "", None)
+    turns = turns_after(root, since)
+    if not body and not turns:
+        return None
+    path = path or _log_files(root)[-1]
+    written = since or datetime.fromtimestamp(path.stat().st_mtime)
+
+    guidance = (
+        "leneu-session: 이전 작업 기록입니다. 사용자가 '.'처럼 짧게만 입력하면 이어가라는 뜻입니다. "
+        "저장소 상태로 다음 액션이 아직 유효한지 확인한 뒤 이어가세요. 사용자의 요청이 이 작업과 무관하면 이 기록은 무시하세요. "
+        f"전체 기록: {path}"
+    )
+    if source == "startup":
+        guidance += f"\n작성 시각: {written:%Y-%m-%d %H:%M}."
+        if (now - written).total_seconds() > 24 * 3600:
+            guidance += " 하루 이상 지난 기록이니 이어갈지 먼저 사용자에게 물어보세요."
+
+    body = body[:MAX_INJECT]
+    room = MAX_INJECT - len(body)
+    if len(turns) > room:
+        turns = turns[-room:] if room else ""
+    parts = [guidance, body]
+    if turns:
+        parts.append("체크포인트 이후의 턴 기록:\n" + turns)
+    return "\n\n".join(p for p in parts if p)
+
+
+def is_allowed_write(root, file_path):
+    """자동 승인은 이 경로뿐이다. 심볼릭 링크로 밖을 가리키면 허용하지 않는다."""
+    if not file_path:
+        return False
+    return Path(file_path).resolve() == root / DIR / PENDING
+
+
+def on_session_start(data):
+    root = find_root(data.get("cwd"))
+    if root is None:
+        return
+    context = build_context(root, data.get("source"), datetime.now())
+    if context:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "SessionStart", "additionalContext": context,
+        }}, ensure_ascii=False))
+
+
+def on_pre_tool_use(data):
+    root = find_root(data.get("cwd"))
+    if root is None or data.get("tool_name") != "Write":
+        return
+    if is_allowed_write(root, (data.get("tool_input") or {}).get("file_path")):
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "leneu-session 체크포인트",
+        }}, ensure_ascii=False))
+
+
+def _project_dir(cwd):
+    """켜고 끌 위치: 이미 있는 폴더, 없으면 가장 가까운 .git, 없으면 cwd."""
+    start = Path(cwd or os.getcwd()).resolve()
+    home = Path.home().resolve()
+    for d in (start, *start.parents):
+        if (d / DIR).is_dir() or (d / ".git").exists():
+            return d
+        if d == home:
+            break
+    return start
+
+
+def cli_init(cwd):
+    target = _project_dir(cwd)
+    folder = target / DIR
+    if target == Path.home().resolve() and not folder.is_dir():
+        return "홈 폴더에서는 켜지 않습니다. 하위의 모든 폴더에 적용되기 때문입니다. 프로젝트 폴더에서 실행하세요."
+    existed = folder.is_dir()
+    disabled = (folder / "disabled").exists()
+    (folder / "logs").mkdir(parents=True, exist_ok=True)
+    if not (folder / ".gitignore").exists():
+        (folder / ".gitignore").write_text("*\n")
+    if disabled:
+        (folder / "disabled").unlink()
+        return f"leneu-session을 다시 켰습니다: {folder}\n기존 기록은 그대로이며 다음 턴부터 다시 기록합니다."
+    if existed:
+        return f"이미 켜져 있습니다: {folder}\n로그 파일 {len(_log_files(target))}개."
+    return f"leneu-session을 켰습니다: {folder}\n훅은 다음 턴부터 기록합니다."
+
+
+def cli_stop(cwd):
+    folder = _project_dir(cwd) / DIR
+    if not folder.is_dir():
+        return "이 프로젝트에서는 켜져 있지 않습니다. 할 일이 없습니다."
+    (folder / "disabled").touch()
+    return (
+        f"leneu-session을 껐습니다: {folder}\n기록은 그대로 남아 있습니다. "
+        "다시 켜려면 /leneu-init, 완전히 지우려면 폴더를 직접 삭제하세요."
+    )
+
+
+HANDLERS = {"Stop": on_stop, "SessionStart": on_session_start, "PreToolUse": on_pre_tool_use}
 
 
 def main():
@@ -650,6 +796,177 @@ def test_stop_moves_leftover_pending_from_crash():
     assert _log_text(root).count("남은 것") == 1
 
 
+def _write_log(root, date, text):
+    (root / ".leneu-session" / "logs" / f"{date}.md").write_text(text)
+
+
+CKPT = "\n## 2026-11-09 14:15 checkpoint tokens=1 session=s\n**원본:** t\n### 다음 액션\n체크포인트 본문표식\n"
+TURN = "\n## 2026-11-09 14:30 turn\n**요청:** 이후 턴표식\n"
+NOW = datetime(2026, 11, 9, 15, 0)
+
+
+def test_latest_checkpoint_stops_at_next_header():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT + TURN)
+    dt, body, path = latest_checkpoint(root)
+    assert dt == datetime(2026, 11, 9, 14, 15)
+    assert "체크포인트 본문표식" in body and "이후 턴표식" not in body
+    assert path.name == "2026-11-09.md"
+
+
+def test_latest_checkpoint_picks_last_and_searches_older_files():
+    root = _project()
+    _write_log(root, "2026-11-08", CKPT.replace("2026-11-09", "2026-11-08").replace("본문표식", "어제"))
+    _write_log(root, "2026-11-09", TURN)
+    assert "어제" in latest_checkpoint(root)[1]
+    _write_log(root, "2026-11-09", CKPT + CKPT.replace("본문표식", "나중"))
+    assert "나중" in latest_checkpoint(root)[1]
+    assert latest_checkpoint(_project()) is None
+
+
+def test_turns_after_crosses_midnight_and_excludes_others():
+    root = _project()
+    _write_log(root, "2026-11-08", "\n## 2026-11-08 23:00 turn\n오래됨\n\n## 2026-11-08 23:50 turn\n어젯밤\n")
+    compact = "\n## 2026-11-09 00:20 compact\n압축표식\n"
+    _write_log(root, "2026-11-09", "\n## 2026-11-09 00:10 turn\n오늘\n" + compact)
+    out = turns_after(root, datetime(2026, 11, 8, 23, 30))
+    assert "어젯밤" in out and "오늘" in out
+    assert "오래됨" not in out and "압축표식" not in out
+
+
+def test_build_context_clear_injects_checkpoint_and_later_turns():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT + TURN)
+    c = build_context(root, "clear", NOW)
+    assert "체크포인트 본문표식" in c and "이후 턴표식" in c
+    assert "확인" in c and "무시" in c and "." in c
+
+
+def test_build_context_compact_gives_path_only():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT + TURN)
+    c = build_context(root, "compact", NOW)
+    assert "본문표식" not in c and "턴표식" not in c and "2026-11-09.md" in c
+
+
+def test_build_context_resume_and_fork_inject_nothing():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    assert build_context(root, "resume", NOW) is None
+    assert build_context(root, "fork", NOW) is None
+
+
+def test_build_context_startup_asks_only_when_old():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    fresh = build_context(root, "startup", datetime(2026, 11, 9, 15, 15))
+    old = build_context(root, "startup", datetime(2026, 11, 10, 15, 16))
+    assert "체크포인트 본문표식" in fresh and "물어" not in fresh
+    assert "체크포인트 본문표식" in old and "물어" in old
+
+
+def test_build_context_empty_is_none():
+    assert build_context(_project(), "clear", NOW) is None
+    assert build_context(_project(), "compact", NOW) is None
+
+
+def test_build_context_turns_only():
+    root = _project()
+    _write_log(root, "2026-11-09", TURN)
+    assert "이후 턴표식" in build_context(root, "clear", NOW)
+    assert build_context(root, "compact", NOW) is None
+
+
+def test_build_context_clips_turns_before_checkpoint():
+    root = _project()
+    many = "".join(f"\n## 2026-11-09 14:30 turn\n{'가' * 500} 턴{i}\n" for i in range(40))
+    _write_log(root, "2026-11-09", CKPT + many)
+    c = build_context(root, "clear", NOW)
+    assert len(c) <= 8000 + 1000
+    assert "체크포인트 본문표식" in c and "턴39" in c and "턴0\n" not in c
+    assert "2026-11-09.md" in c
+
+
+def test_is_allowed_write_only_pending():
+    root = _project()
+    assert is_allowed_write(root, str(root / ".leneu-session/.pending-checkpoint.md"))
+    assert not is_allowed_write(root, str(root / ".leneu-session/logs/2026-11-09.md"))
+    assert not is_allowed_write(root, str(root / ".leneu-session/../evil.md"))
+    assert not is_allowed_write(root, str(root / ".leneu-session/logs/../../evil.md"))
+    assert not is_allowed_write(root, "/etc/passwd")
+    assert not is_allowed_write(root, "")
+
+
+def test_is_allowed_write_rejects_symlink_escape():
+    root = _project()
+    target = root / "outside.md"
+    (root / ".leneu-session" / ".pending-checkpoint.md").symlink_to(target)
+    assert not is_allowed_write(root, str(root / ".leneu-session/.pending-checkpoint.md"))
+
+
+def test_on_pre_tool_use_allows_and_stays_silent_otherwise():
+    root = _project()
+    data = {"cwd": str(root), "tool_name": "Write",
+            "tool_input": {"file_path": str(root / ".leneu-session/.pending-checkpoint.md")}}
+    out = _capture(on_pre_tool_use, data)
+    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert _capture(on_pre_tool_use, dict(data, tool_input={"file_path": "/etc/passwd"})) is None
+    assert _capture(on_pre_tool_use, dict(data, tool_name="Edit")) is None
+
+
+def test_on_session_start_outputs_additional_context():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT)
+    out = _capture(on_session_start, {"cwd": str(root), "source": "clear"})
+    assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "체크포인트 본문표식" in out["hookSpecificOutput"]["additionalContext"]
+    assert _capture(on_session_start, {"cwd": str(root), "source": "resume"}) is None
+
+
+def test_cli_init_creates_gitignore_and_reports_when_repeated():
+    d = Path(tempfile.mkdtemp()).resolve()
+    (d / ".git").mkdir()
+    (d / "sub").mkdir()
+    msg = cli_init(str(d / "sub"))
+    assert (d / ".leneu-session" / ".gitignore").read_text() == "*\n"
+    assert (d / ".leneu-session" / "logs").is_dir()
+    assert not (d / "sub" / ".leneu-session").exists()
+    assert "다음 턴" in msg
+    assert "이미 켜져" in cli_init(str(d))
+
+
+def test_cli_stop_keeps_logs_and_init_reenables():
+    root = _project()
+    _write_log(root, "2026-11-09", TURN)
+    assert "/leneu-init" in cli_stop(str(root))
+    assert (root / ".leneu-session" / "disabled").exists()
+    assert "이후 턴표식" in _log_text(root)
+    assert _stop(root, 47000, prompt="꺼짐표식") is None
+    assert "꺼짐표식" not in _log_text(root)
+    assert "다시" in cli_init(str(root))
+    assert find_root(str(root)) == root
+    assert "이후 턴표식" in _log_text(root)
+
+
+def test_cli_init_refuses_home():
+    home = Path(tempfile.mkdtemp()).resolve()
+    old = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    try:
+        assert "프로젝트 폴더" in cli_init(str(home))
+        assert not (home / ".leneu-session").exists()
+    finally:
+        os.environ["HOME"] = old
+
+
+def test_cli_stop_without_folder_creates_nothing():
+    d = Path(tempfile.mkdtemp()).resolve()
+    (d / ".git").mkdir()
+    cli_stop(str(d))
+    assert not (d / ".leneu-session").exists()
+
+
 def selftest():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
@@ -664,4 +981,11 @@ def selftest():
 
 
 if __name__ == "__main__":
-    selftest() if "--selftest" in sys.argv else main()
+    if "--selftest" in sys.argv:
+        selftest()
+    elif "--init" in sys.argv:
+        print(cli_init(os.getcwd()))
+    elif "--stop" in sys.argv:
+        print(cli_stop(os.getcwd()))
+    else:
+        main()
