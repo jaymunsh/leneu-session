@@ -1,0 +1,13 @@
+{
+  "name": "leneu-session",
+  "owner": {
+    "name": "jaymunsh"
+  },
+  "plugins": [
+    {
+      "name": "leneu-session",
+      "source": "./",
+      "description": "일정 작업량마다 체크포인트를 자동으로 남기고, /clear 후 하던 일을 자동으로 잇는다."
+    }
+  ]
+}
