@@ -55,7 +55,7 @@ git clone https://github.com/jaymunsh/leneu-session.git
 claude --plugin-dir ./leneu-session
 ```
 
-`/leneu-init` 같은 짧은 이름이 인식되지 않으면 전체 이름을 쓰세요: `/leneu-session:leneu-init`
+**명령은 전체 이름으로 치거나 메뉴에서 고르세요.** `/leneu` 까지 치고 메뉴에서 고르거나, `/leneu-session:leneu-stop` 처럼 전체를 칩니다. `/leneu-stop` 같은 짧은 이름은 시험에서 불안정했고, 한 번은 `Unknown command` 가 나왔습니다. Enter 전에 실행될 명령을 확인하세요. 이 문서는 읽기 쉽도록 짧은 이름으로 적었습니다.
 
 ## 흐름 자세히 보기
 
@@ -154,10 +154,10 @@ claude --plugin-dir ./leneu-session
 | 키 | 기본값 | 뜻 |
 |---|---|---|
 | `context_window` | `1000000` | 컨텍스트 창 크기(토큰). **자동으로 감지할 수 없습니다.** |
-| `clear_recommend_pct` | `30` | 창의 이 비율을 넘긴 첫 체크포인트에서 `/clear` 를 권합니다. |
+| `clear_recommend_pct` | `30` | 창의 이 비율을 넘긴 첫 턴이 끝날 때 `/clear` 를 권하고, 이후 체크포인트마다 다시 권합니다. |
 | `checkpoint_every_pct` | `10` | 컨텍스트가 창의 이 비율만큼 늘 때마다 체크포인트를 요청합니다. |
 
-기본값에서는 약 100K 토큰마다 체크포인트를 요청합니다. 권고는 300K를 넘긴 첫 체크포인트에서 뜨며, 47K에서 시작했다면 약 347K입니다.
+기본값에서는 약 100K 토큰마다 체크포인트를 요청하고, 권고는 300K를 넘긴 첫 턴이 끝날 때 뜹니다. 훅은 턴 사이에만 실행되므로, 한 턴이 길면 기준을 크게 넘긴 뒤에 뜰 수 있습니다.
 
 **200K 창을 쓴다면 바꾸세요.** 그대로 두면 권고가 뜨기 전에 auto-compact가 먼저 일어날 수 있습니다.
 

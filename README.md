@@ -55,7 +55,7 @@ git clone https://github.com/jaymunsh/leneu-session.git
 claude --plugin-dir ./leneu-session
 ```
 
-If a short name such as `/leneu-init` isn't recognized, use the full form: `/leneu-session:leneu-init`.
+**Use the full command names, or pick from the menu.** Type `/leneu` and choose the command, or type `/leneu-session:leneu-stop` in full. Short names such as `/leneu-stop` were unreliable in testing: one attempt returned `Unknown command`. Check the running command before pressing Enter. This README uses short names for readability.
 
 ## The flow in detail
 
@@ -155,10 +155,10 @@ Create `.leneu-session/config.json` if you need to. Every key is optional, and i
 | Key | Default | Meaning |
 |---|---|---|
 | `context_window` | `1000000` | Context window size in tokens. **It can't be detected automatically.** |
-| `clear_recommend_pct` | `30` | Recommend `/clear` at the first checkpoint past this percentage of the window. |
+| `clear_recommend_pct` | `30` | Recommend `/clear` at the end of the first turn past this percentage of the window, then at each later checkpoint. |
 | `checkpoint_every_pct` | `10` | Request a checkpoint each time context grows by this percentage of the window. |
 
-With the defaults, a checkpoint is requested about every 100K tokens. The recommendation appears at the first checkpoint past 300K, which is around 347K if the session started at 47K.
+With the defaults, a checkpoint is requested about every 100K tokens, and the recommendation appears at the end of the first turn past 300K. Hooks only run between turns, so one long turn can overshoot the threshold.
 
 **If you use a 200K window, change this.** Otherwise auto-compact may fire before any recommendation appears:
 

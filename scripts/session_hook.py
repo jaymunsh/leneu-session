@@ -242,9 +242,12 @@ def append_log(root, text, now):
 
 def decide_checkpoint(cfg, sess, tokens):
     window = cfg["context_window"]
+    over = tokens >= window * cfg["clear_recommend_pct"] / 100
+    if over and not sess.get("recommended"):  # 기준을 넘은 첫 턴에 바로 권한다. 간격을 기다리지 않는다
+        return "checkpoint+clear"
     if tokens - sess["last_ckpt"] < window * cfg["checkpoint_every_pct"] / 100:
         return "none"
-    return "checkpoint+clear" if tokens >= window * cfg["clear_recommend_pct"] / 100 else "checkpoint"
+    return "checkpoint+clear" if over else "checkpoint"
 
 
 def checkpoint_reason(root, recommend_clear):
@@ -327,13 +330,15 @@ def on_stop(data):
             if "last_ckpt" not in sess or tokens < sess["last_ckpt"]:  # 첫 측정 또는 압축 직후
                 sess["baseline"] = sess["last_ckpt"] = tokens
                 sess["handoff_seen"] = handoff_id
-            elif handoff_id != sess.get("handoff_seen"):  # 방금 수동으로 남겼으니 겹쳐 쓰지 않는다
+                sess.pop("recommended", None)
+            if handoff_id != sess.get("handoff_seen"):  # 방금 수동으로 남겼으니 겹쳐 쓰지 않는다
                 sess["handoff_seen"] = handoff_id
                 sess["last_ckpt"] = tokens
             elif not active and not is_noninteractive(_entrypoint()):
                 action = decide_checkpoint(load_config(root), sess, tokens)
                 if action != "none":
                     sess["last_ckpt"] = tokens
+                    sess["recommended"] = sess.get("recommended") or action == "checkpoint+clear"
                     # decision: block은 transcript에 오류로 남아 모델이 체크포인트에 오류라고 적는다
                     output = {"hookSpecificOutput": {
                         "hookEventName": "Stop",
@@ -1434,6 +1439,32 @@ def test_cli_stop_without_folder_creates_nothing():
     (d / ".git").mkdir()
     cli_stop(str(d))
     assert not (d / ".leneu-session").exists()
+
+
+def test_decide_checkpoint_recommends_as_soon_as_limit_is_crossed():
+    assert decide_checkpoint(CFG, {"last_ckpt": 280000}, 300000) == "checkpoint+clear"
+    assert decide_checkpoint(CFG, {"last_ckpt": 300000, "recommended": True}, 350000) == "none"
+    assert decide_checkpoint(CFG, {"last_ckpt": 300000, "recommended": True}, 400000) == "checkpoint+clear"
+
+
+def test_stop_recommends_on_first_turn_past_limit_then_at_intervals():
+    root = _project()
+    _stop(root, 250000)
+    assert "/clear" in _stop(root, 305000)["hookSpecificOutput"]["additionalContext"]
+    assert _stop(root, 350000) is None  # 다음 턴에 또 재촉하지 않는다
+    assert "/clear" in _stop(root, 405000)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_stop_first_measure_past_limit_recommends():
+    root = _project()  # 세션 중간에 켰거나 첫 턴이 큰 경우
+    assert "/clear" in _stop(root, 400000)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_stop_recommends_again_after_compaction():
+    root = _project()
+    _stop(root, 305000)
+    assert _stop(root, 50000) is None
+    assert "/clear" in _stop(root, 301000)["hookSpecificOutput"]["additionalContext"]
 
 
 def _append(t, *entries, **kw):
