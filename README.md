@@ -14,7 +14,7 @@ Long tasks outlive a single context window. Waiting for auto-compact means summa
 .                                  any short input, and work continues
 ```
 
-> **Status: 0.1.0, early.** The hooks, checkpoints and resume logic are covered by a self-test. The full interactive flow (checkpoint, `/clear`, `.`, `/compact`, interrupt) has been run in a real session in the default permission mode, but not yet in auto mode or over a long real-world trial. Please report anything odd.
+> **Status: 0.2.0, early.** The hooks, checkpoints and resume logic are covered by a self-test. The full interactive flow (checkpoint, `/clear`, `.`, `/compact`, interrupt) has been run in a real session in the default permission mode, but not yet in auto mode or over a long real-world trial. Please report anything odd.
 
 ## Contents
 
@@ -94,9 +94,10 @@ Checkpoints list what the next session needs to act, not a story of what happene
 - Changed files and whether they were verified
 - Decisions: what was chosen, what was rejected, and why
 - Dead ends: what was tried and why it failed
+- Done criteria: what has to be true for the task to count as finished
 - Next actions: one to three, with file paths
 
-Dead ends matter most. `git log` tells the next session what changed, but only this record tells it which approach was abandoned.
+Done criteria keep a resumed session from stopping early or running past the goal. Dead ends matter most. `git log` tells the next session what changed, but only this record tells it which approach was abandoned.
 
 ### What happens on each kind of session start
 

@@ -258,7 +258,7 @@ def checkpoint_reason(root, recommend_clear):
         "### 헤더로 아래 순서대로, 해당 없는 항목은 빼고 6000자 이내, 비밀값 없이 씁니다: "
         "현재 작업의 요구와 사용자 정정(원문 그대로. 이전 체크포인트의 원문도 잇되 끝난 작업 것은 뺌) / "
         "확인된 사실(경로·명령·값·에러) / 변경 파일과 검증 여부 / 결정(고른 것, 버린 것, 이유) / "
-        "막다른 길(실패한 시도와 이유) / 다음 액션(1~3개, 파일 경로 포함)",
+        "막다른 길(실패한 시도와 이유) / 완료 기준(무엇이 되면 끝인가) / 다음 액션(1~3개, 파일 경로 포함)",
     ]
     if recommend_clear:
         lines.append("답 끝에 '컨텍스트가 커졌습니다. 작업이 일단락되면 /clear를 권합니다.'를 붙이세요.")
@@ -916,8 +916,9 @@ def test_decide_checkpoint_recommends_clear_past_limit():
 def test_checkpoint_reason_contents():
     root = _project()
     r = checkpoint_reason(root, True)
-    for h in ["현재 작업의 요구와 사용자 정정", "확인된 사실", "변경 파일과 검증 여부", "결정", "막다른 길", "다음 액션"]:
+    for h in ["현재 작업의 요구와 사용자 정정", "확인된 사실", "변경 파일과 검증 여부", "결정", "막다른 길", "완료 기준", "다음 액션"]:
         assert h in r, h
+    assert r.index("완료 기준") < r.index("다음 액션")
     assert str(root / ".leneu-session" / ".pending-checkpoint.md") in r
     assert "/clear" in r and "비밀값" in r
     assert "/clear" not in checkpoint_reason(root, False)
