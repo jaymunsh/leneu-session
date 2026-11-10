@@ -14,7 +14,7 @@ Long tasks outlive a single context window. Waiting for auto-compact means summa
 .                                  any short input, and work continues
 ```
 
-> **Status: 0.1.0, early.** The hooks, checkpoints and resume logic are covered by a self-test and were exercised against real `claude -p` runs. The full interactive flow (`/clear`, then `.`) has not yet had a long real-world trial, so please report anything odd.
+> **Status: 0.1.0, early.** The hooks, checkpoints and resume logic are covered by a self-test. The full interactive flow (checkpoint, `/clear`, `.`, `/compact`, interrupt) has been run in a real session in the default permission mode, but not yet in auto mode or over a long real-world trial. Please report anything odd.
 
 ## Contents
 
@@ -65,7 +65,7 @@ claude --plugin-dir ./leneu-session
 
   (you work)                    each turn is appended to today's log
 
-  ~100K tokens of new context   Claude writes a checkpoint in one short
+  ~50K tokens of new context    Claude writes a checkpoint in one short
                                 extra turn and replies "체크포인트 저장"
                                 ("checkpoint saved")
 
@@ -104,7 +104,7 @@ Dead ends matter most. `git log` tells the next session what changed, but only t
 |---|---|
 | `/clear` | The latest checkpoint or handoff, plus the turns after it |
 | New session | The same, with its age. If it's over 24 hours old, Claude asks whether to continue before acting on it |
-| After compaction | Only the location of the record, since the compaction summary is already there and work is still in progress |
+| After compaction | The latest checkpoint and the turns after it, to restore decisions and dead ends the summary may have dropped. Claude carries on without briefing you |
 | Resume or fork | Nothing, since the conversation is already present |
 | `claude -p` | Nothing. Turns are still logged, but no checkpoints are requested |
 
@@ -156,9 +156,9 @@ Create `.leneu-session/config.json` if you need to. Every key is optional, and i
 |---|---|---|
 | `context_window` | `1000000` | Context window size in tokens. **It can't be detected automatically.** |
 | `clear_recommend_pct` | `30` | Recommend `/clear` at the end of the first turn past this percentage of the window, then at each later checkpoint. |
-| `checkpoint_every_pct` | `10` | Request a checkpoint each time context grows by this percentage of the window. |
+| `checkpoint_every_pct` | `5` | Request a checkpoint each time context grows by this percentage of the window. |
 
-With the defaults, a checkpoint is requested about every 100K tokens, and the recommendation appears at the end of the first turn past 300K. Hooks only run between turns, so one long turn can overshoot the threshold.
+With the defaults, a checkpoint is requested about every 50K tokens, and the recommendation appears at the end of the first turn past 300K. Hooks only run between turns, so one long turn can overshoot the threshold.
 
 **If you use a 200K window, change this.** Otherwise auto-compact may fire before any recommendation appears:
 
@@ -207,7 +207,7 @@ Logs split by day and are never rewritten. Each turn keeps up to 400 characters 
 
 ## How it works
 
-One Python script, four hooks.
+One Python script, five hooks.
 
 | Hook | Fires when | What it does |
 |---|---|---|
@@ -215,6 +215,7 @@ One Python script, four hooks.
 | `SessionStart` | A session starts | Recovers a checkpoint left behind by an interrupted session, injects the context from the table above, reports hook errors, and enables new git worktrees |
 | `PreToolUse` (`Write`) | Before a file write | Auto-approves only the plugin's own checkpoint and handoff files |
 | `PreCompact` | Before compaction | Notes where the uncompacted transcript lives |
+| `SessionEnd` | A session ends, including `/clear` | Logs a turn you interrupted with Esc, which `Stop` never saw |
 
 Some design decisions worth knowing:
 
@@ -246,7 +247,6 @@ Some design decisions worth knowing:
 - **Concurrent sessions aren't distinguished.** With the same folder open in several terminals, `/clear` may read another terminal's checkpoint. Checking the repository on resume reduces the risk. Subagents and worktrees aren't affected.
 - **`context_window` is manual.** The hook input doesn't include it.
 - **Non-interactive detection relies on an undocumented value.** `CLAUDE_CODE_ENTRYPOINT` is `sdk-cli` under `claude -p`. If it's missing, the session is treated as interactive.
-- **Interrupting and then clearing loses that turn.** `Stop` doesn't fire after Esc, so running `/clear` right after leaves the interrupted turn out of the log.
 - **Other agents aren't supported yet.** Claude Code comes first, with Codex and others possible later. `/leneu-handoff` already produces a plain file any agent can read.
 
 Skill and command instructions are written in Korean. Claude replies in whatever language you use, though some fixed lines and log labels stay Korean.

@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 DIR = ".leneu-session"
-DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 10}
+DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 5}
 MAX_SESSIONS = 20
 PENDING = ".pending-checkpoint.md"
 MAX_INJECT = 8000
@@ -189,7 +189,7 @@ def parse_turns(entries):
             if e.get("isMeta") or e.get("isCompactSummary"):
                 continue
             prompt, command = _prompt(_text(content))
-            if prompt:
+            if prompt and not prompt.startswith("[Request interrupted"):
                 turns.append({"prompt": prompt, "reply": "", "tools": [], "files": [], "command": command})
         elif e.get("type") == "assistant" and turns:
             turn = turns[-1]
@@ -251,22 +251,17 @@ def decide_checkpoint(cfg, sess, tokens):
 
 
 def checkpoint_reason(root, recommend_clear):
-    path = root / DIR / PENDING
+    """화면에 그대로 보이므로 짧게 쓴다."""
     lines = [
-        "leneu-session 체크포인트 시점입니다. 다른 작업을 시작하지 말고 아래 파일 하나만 Write로 작성하세요.",
-        f"파일: {path}",
-        "다음 세션이 이 파일만 읽고 이어갈 수 있게, 줄거리가 아니라 행동에 필요한 것만 씁니다. "
-        "비밀값은 적지 마세요. 헤더는 ###만 씁니다. 해당 없는 항목은 뺍니다. 전체 6000자 이내로 씁니다.",
-        "### 현재 작업의 요구와 사용자 정정 (원문) — 요약하지 말고 원문 그대로. 이전 체크포인트의 원문도 이어 적고, 새 작업으로 넘어갔다면 이전 작업의 요구는 뺀다",
-        "### 확인된 사실 (경로·명령·값·에러)",
-        "### 변경 파일과 검증 여부",
-        "### 결정 (고른 것, 버린 것, 이유)",
-        "### 막다른 길 (시도했다 실패한 것과 이유)",
-        "### 다음 액션 (1~3개, 파일 경로 포함)",
-        "작성 후 '체크포인트 저장'이라고 한 줄만 답하세요.",
+        f"leneu-session 체크포인트 시점입니다. 다른 작업 없이 {root / DIR / PENDING} 하나만 Write로 쓰고 "
+        "'체크포인트 저장'이라고만 답하세요.",
+        "### 헤더로 아래 순서대로, 해당 없는 항목은 빼고 6000자 이내, 비밀값 없이 씁니다: "
+        "현재 작업의 요구와 사용자 정정(원문 그대로. 이전 체크포인트의 원문도 잇되 끝난 작업 것은 뺌) / "
+        "확인된 사실(경로·명령·값·에러) / 변경 파일과 검증 여부 / 결정(고른 것, 버린 것, 이유) / "
+        "막다른 길(실패한 시도와 이유) / 다음 액션(1~3개, 파일 경로 포함)",
     ]
     if recommend_clear:
-        lines.append("그 줄 뒤에 '컨텍스트가 커졌습니다. 작업이 일단락되면 /clear를 권합니다.'를 덧붙이세요.")
+        lines.append("답 끝에 '컨텍스트가 커졌습니다. 작업이 일단락되면 /clear를 권합니다.'를 붙이세요.")
     return "\n".join(lines)
 
 
@@ -315,11 +310,7 @@ def on_stop(data):
     output = None
     try:
         if not active:
-            turns = _new_turns(entries, sess.get("cursor"))
-            if turns and message and message.strip() not in turns[-1]["reply"]:
-                turns[-1]["reply"] = (turns[-1]["reply"] + "\n\n" + message.strip()).strip()
-            for turn in turns:
-                append_log(root, render_turn(turn, now), now)
+            _record_turns(root, entries, sess, message, now)
 
         tokens = context_tokens(entries)
         consume_pending(root, tokens, sid, transcript, now)
@@ -345,13 +336,42 @@ def on_stop(data):
                         "additionalContext": checkpoint_reason(root, action == "checkpoint+clear"),
                     }}
     finally:  # 커서를 못 남기면 다음 Stop마다 같은 턴이 다시 쌓이고 같은 오류가 반복된다
-        for e in reversed(entries):  # 끝에는 uuid 없는 메타 항목이 올 수 있다
-            if e.get("uuid"):
-                sess["cursor"] = e["uuid"]
-                break
+        _move_cursor(entries, sess)
         save_state(root, state)
     if output:
         print(json.dumps(output, ensure_ascii=False))
+
+
+def _record_turns(root, entries, sess, message, now):
+    turns = _new_turns(entries, sess.get("cursor"))
+    if turns and message and message.strip() not in turns[-1]["reply"]:
+        turns[-1]["reply"] = (turns[-1]["reply"] + "\n\n" + message.strip()).strip()
+    for turn in turns:
+        append_log(root, render_turn(turn, now), now)
+
+
+def _move_cursor(entries, sess):
+    for e in reversed(entries):  # 끝에는 uuid 없는 메타 항목이 올 수 있다
+        if e.get("uuid"):
+            sess["cursor"] = e["uuid"]
+            return
+
+
+def on_session_end(data):
+    """Esc로 끊긴 턴은 Stop이 없다. 바로 /clear 하면 여기서만 남길 수 있다."""
+    root = find_root(data.get("cwd"))
+    if root is None:
+        return
+    entries = load_transcript(data.get("transcript_path"))
+    state = load_state(root)
+    sid = data.get("session_id") or "?"
+    sess = state.pop(sid, {})
+    state[sid] = sess
+    try:
+        _record_turns(root, entries, sess, None, datetime.now())
+    finally:
+        _move_cursor(entries, sess)
+        save_state(root, state)
 
 
 def _sections(text):
@@ -415,13 +435,8 @@ def build_context(root, source, now):
     if source not in ("clear", "startup", "compact"):
         return None
     latest = _latest_source(root)
-    if source == "compact":
-        if not latest:
-            return None
-        return (
-            "컨텍스트 압축 직후라 하던 작업이 그대로 이어지는 중입니다. 브리핑하거나 다시 묻지 말고 계속하세요. "
-            f"압축 요약에 빠진 것이 있을 때만 {latest[2]} 의 마지막 기록을 보세요."
-        )
+    if source == "compact" and not latest:
+        return None  # 턴 기록은 압축 요약이 이미 담고 있다
     since, body, path = latest or (None, "", None)
     turns = turns_after(root, since)
     if not body and not turns:
@@ -429,11 +444,18 @@ def build_context(root, source, now):
     path = path or _log_files(root)[-1]
     written = since or datetime.fromtimestamp(path.stat().st_mtime)
 
-    guidance = (
-        "leneu-session: 이전 작업 기록입니다. 사용자가 '.'처럼 짧게만 입력하면 이어가라는 뜻입니다. "
-        "저장소 상태로 다음 액션이 아직 유효한지 확인한 뒤 이어가세요. 사용자의 요청이 이 작업과 무관하면 이 기록은 무시하세요. "
-        f"전체 기록: {path}"
-    )
+    if source == "compact":
+        guidance = (
+            "leneu-session: 컨텍스트 압축 직후입니다. 아래는 압축 전 마지막 기록과 그 뒤의 턴으로, "
+            "압축 요약에서 빠진 결정과 실패한 시도를 보완합니다. 브리핑하거나 다시 묻지 말고 하던 작업을 계속하세요. "
+            f"전체 기록: {path}"
+        )
+    else:
+        guidance = (
+            "leneu-session: 이전 작업 기록입니다. 사용자가 '.'처럼 짧게만 입력하면 이어가라는 뜻입니다. "
+            "저장소 상태로 다음 액션이 아직 유효한지 확인한 뒤 이어가세요. 사용자의 요청이 이 작업과 무관하면 이 기록은 무시하세요. "
+            f"전체 기록: {path}"
+        )
     if source == "startup":
         guidance += f"\n작성 시각: {written:%Y-%m-%d %H:%M}."
         if (now - written).total_seconds() > 24 * 3600:
@@ -631,6 +653,7 @@ HANDLERS = {
     "SessionStart": on_session_start,
     "PreToolUse": on_pre_tool_use,
     "PreCompact": on_precompact,
+    "SessionEnd": on_session_end,
 }
 
 
@@ -698,7 +721,7 @@ def test_find_root_none_when_disabled():
 
 def test_load_config_defaults():
     cfg = load_config(_project())
-    assert cfg == {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 10}
+    assert cfg == {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 5}
 
 
 def test_load_config_override_keeps_other_defaults():
@@ -909,6 +932,7 @@ def test_stop_first_measure_sets_baseline_without_block():
 
 def test_stop_blocks_once_per_interval():
     root = _project()
+    (root / ".leneu-session" / "config.json").write_text('{"checkpoint_every_pct": 10}')
     _stop(root, 47000)
     assert _stop(root, 146999) is None
     out = _stop(root, 147000)
@@ -1218,11 +1242,12 @@ def test_build_context_compact_points_to_handoff_when_newest():
     _write_log(root, "2026-11-09", CKPT)
     _handoff(root, "handoff-1.md", "인계 본문표식", datetime(2026, 11, 9, 14, 40))
     c = build_context(root, "compact", NOW)
-    assert "handoff-1.md" in c and "인계 본문표식" not in c
+    assert "handoff-1.md" in c and "인계 본문표식" in c
 
 
 def test_stop_new_handoff_resets_interval_without_checkpoint():
     root = _project()
+    (root / ".leneu-session" / "config.json").write_text('{"checkpoint_every_pct": 10}')
     _handoff(root, "handoff-0.md", "세션 전", datetime(2026, 11, 8))
     _stop(root, 47000)
     _handoff(root, "handoff-1.md", "수동", datetime(2026, 11, 9, 14, 40))
@@ -1316,11 +1341,12 @@ def test_build_context_clear_injects_checkpoint_and_later_turns():
     assert "확인" in c and "무시" in c and "." in c
 
 
-def test_build_context_compact_gives_path_only():
+def test_build_context_compact_restores_checkpoint_without_briefing():
     root = _project()
     _write_log(root, "2026-11-09", CKPT + TURN)
     c = build_context(root, "compact", NOW)
-    assert "본문표식" not in c and "턴표식" not in c and "2026-11-09.md" in c
+    assert "체크포인트 본문표식" in c and "이후 턴표식" in c and "2026-11-09.md" in c
+    assert "계속" in c and "브리핑" in c and "." not in c.split("\n")[0][:20]
 
 
 def test_build_context_resume_and_fork_inject_nothing():
@@ -1465,6 +1491,30 @@ def test_stop_recommends_again_after_compaction():
     _stop(root, 305000)
     assert _stop(root, 50000) is None
     assert "/clear" in _stop(root, 301000)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_checkpoint_reason_is_short():
+    r = checkpoint_reason(_project(), True)
+    assert len(r.splitlines()) <= 3 and len(r) < 700, (len(r.splitlines()), len(r))
+
+
+def test_session_end_logs_interrupted_turn_once():
+    root = _project()
+    _stop(root, 47000, prompt="앞요청")
+    t = root / "t-s1.jsonl"
+    _append(t, dict(_user("중단된요청"), uuid="x1"), dict(_assistant("하다만답"), uuid="x2"),
+            dict(_user("[Request interrupted by user]"), uuid="x3"))
+    on_session_end({"cwd": str(root), "session_id": "s1", "transcript_path": str(t), "reason": "clear"})
+    on_session_end({"cwd": str(root), "session_id": "s1", "transcript_path": str(t), "reason": "clear"})
+    text = _log_text(root)
+    assert text.count("중단된요청") == 1 and "하다만답" in text and "interrupted" not in text
+    _stop(root, 47000, prompt="뒤요청")
+    assert _log_text(root).count("중단된요청") == 1
+
+
+def test_parse_turns_skips_interrupt_marker():
+    turns = parse_turns([_user("요청"), _assistant("일부"), _user("[Request interrupted by user for tool use]")])
+    assert [t["prompt"] for t in turns] == ["요청"]
 
 
 def _append(t, *entries, **kw):
