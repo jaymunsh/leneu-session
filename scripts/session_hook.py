@@ -13,15 +13,17 @@ import tempfile
 import threading
 import time
 from contextlib import redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta
 from fnmatch import fnmatch
 from pathlib import Path
 
 
 DIR = ".leneu-session"
-DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 5}
+DEFAULTS = {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 5, "keep_log_days": 0}
 MAX_SESSIONS = 20
-PENDING = ".pending-checkpoint.md"
+MAX_DEFER = 8  # 완료 알림이 끝내 안 오는 작업을 이 횟수의 Stop까지만 기다린다
+PENDING = ".pending-checkpoint.md"  # 세션을 모를 때(예전 버전, 테스트) 쓰는 이름
+PENDING_OF = re.compile(r"^\.pending-checkpoint-([\w-]{1,8})\.md$")
 MAX_INJECT = 8000
 TURNS_ROOM = 2000
 FLUSH_WAIT = 2.0
@@ -38,6 +40,25 @@ SECRET = re.compile(
     r"\bsk-[\w-]{16,}|\bghp_\w{16,}|\bgithub_pat_\w{10,}|\bAKIA[0-9A-Z]{16}\b"
     r"|\bBearer\s+[\w.~+/-]{10,}|\bxox[bp]-[\w-]{8,}"
 )
+# 보안 모드에서만 가린다. 순서가 중요하다: 긴 형식(이메일·카드)을 먼저 가려야 짧은 형식이 그 일부를 먹지 않는다
+SECURE_RULES = [
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[이메일]"),
+    (re.compile(r"(?<![\w.-])(?:https?://)?[\w-]+(?:\.[\w-]+)*\.(?:internal|corp|local|intra|lan)(?![\w.-])"
+                r"(?:[:/][^\s)\]>\"']*)?"), "[내부주소]"),
+    (re.compile(r"(?<!\d)\d{6}-[1-8]\d{6}(?!\d)"), "[주민번호]"),
+    (re.compile(r"(?<!\d)\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}(?!\d)"), "[카드번호]"),
+    (re.compile(r"(?<![\d+])(?:\+82[- ]?|0)1[016789][- .]?\d{3,4}[- .]?\d{4}(?!\d)"
+                r"|(?<![\d+])0(?:2|[3-6]\d)[- .]\d{3,4}[- .]\d{4}(?!\d)"), "[전화번호]"),
+    (re.compile(r"(?<![\d-])\d{2,6}-\d{2,6}-\d{2,7}(?![\d-])"), "[계좌번호]"),
+    (re.compile(r"(?<![\d.])(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})"
+                r"(?![\d.])"), "[내부IP]"),
+    # 대소문자와 숫자가 섞인 긴 문자열. 커밋 해시·UUID(소문자 16진)와 경로는 건드리지 않는다
+    (re.compile(r"(?<![\w/.-])(?=[\w-]*[a-z])(?=[\w-]*[A-Z])(?=[\w-]*\d)[\w-]{32,}(?![\w/.-])"), "[토큰]"),
+]
+CONFIDENTIAL = re.compile(r"대외비|기밀|사내\s*(?:한정|전용)|confidential|internal use only|do not distribute|\bNDA\b", re.I)
+# 백그라운드 Bash는 기다리지 않는다. 개발 서버처럼 끝나지 않는 명령이 흔하다 (실제 기록 13세션 중 다수)
+LAUNCHED = re.compile(r"\s*Async agent launched successfully")
+NOTIFIED = re.compile(r"<task-notification>.*?<tool-use-id>(.*?)</tool-use-id>", re.S)
 
 
 def find_root(cwd):
@@ -45,9 +66,11 @@ def find_root(cwd):
     start = Path(cwd or os.getcwd()).resolve()
     home = Path.home().resolve()
     for d in (start, *start.parents):
+        if d == home:  # 홈에 폴더가 있어도 하위 전체를 기록하게 두지 않는다
+            return None
         if (d / DIR).is_dir():
             return None if (d / DIR / "disabled").exists() else d
-        if (d / ".git").exists() or d == home:
+        if (d / ".git").exists():
             return None
     return None
 
@@ -66,6 +89,14 @@ def load_config(root):
         k: raw[k] if isinstance(raw.get(k), (int, float)) and not isinstance(raw.get(k), bool) and raw[k] > 0 else v
         for k, v in DEFAULTS.items()
     }
+
+
+def load_secure(root, any_state=False):
+    """보안 모드 설정. 꺼져 있으면 None (any_state면 꺼져 있어도 지정어 목록을 준다)."""
+    raw = _read_json_dict(root / DIR / "secure.json")
+    terms = raw.get("terms") if isinstance(raw.get("terms"), list) else []
+    secure = {"enabled": raw.get("enabled") is True, "terms": [t for t in terms if isinstance(t, str) and t.strip()]}
+    return secure if secure["enabled"] or any_state else None
 
 
 def load_state(root):
@@ -178,6 +209,28 @@ def _prompt(text):
     return f"{command.group(1)} {args.group(1) if args else ''}".strip(), True
 
 
+def _queued_prompt(entry):
+    """모델이 일하는 도중 입력한 메시지는 user 항목이 아니라 queued_command 첨부로만 남는다."""
+    a = entry.get("attachment")
+    return _text(a.get("prompt")) if isinstance(a, dict) and a.get("type") == "queued_command" else None
+
+
+def running_tasks(entries):
+    """백그라운드로 띄웠는데 아직 완료 알림이 오지 않은 서브에이전트의 tool_use_id."""
+    launched, done = set(), set()
+    for e in entries:
+        if e.get("isSidechain"):
+            continue
+        content = _message(e).get("content")
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and LAUNCHED.match(_text(b.get("content"))):
+                launched.add(b.get("tool_use_id"))
+        for text in (_queued_prompt(e), _text(content)):
+            if text and "<task-notification>" in text:
+                done.update(NOTIFIED.findall(text))
+    return launched - done
+
+
 def parse_turns(entries):
     """사람이 보낸 요청마다 턴 하나. 시스템이 끼워 넣은 user 항목은 턴이 아니다."""
     turns = []
@@ -185,10 +238,11 @@ def parse_turns(entries):
         if e.get("isSidechain"):
             continue
         content = _message(e).get("content")
-        if e.get("type") == "user":
+        queued = _queued_prompt(e)
+        if e.get("type") == "user" or queued is not None:
             if e.get("isMeta") or e.get("isCompactSummary"):
                 continue
-            prompt, command = _prompt(_text(content))
+            prompt, command = _prompt(_text(content) if queued is None else queued)
             if prompt and not prompt.startswith("[Request interrupted"):
                 turns.append({"prompt": prompt, "reply": "", "tools": [], "files": [], "command": command})
         elif e.get("type") == "assistant" and turns:
@@ -209,26 +263,53 @@ def parse_turns(entries):
     return [t for t in turns[:-1] if not t["command"] or t["reply"] or t["tools"]] + turns[-1:]
 
 
+def redact(text, secure):
+    """가린 글과 가린 개수. 비밀값은 항상, 나머지는 보안 모드일 때만 가린다.
+    ponytail: 형식 있는 값과 지정어만 잡는다. 평문으로 쓴 기밀은 지정어와 체크포인트 지시문에 맡긴다."""
+    rules = [(SECRET, "[비밀값 가림]")] + (SECURE_RULES if secure else [])
+    terms = secure["terms"] if secure else []
+    if terms:
+        index = {t.lower(): i for i, t in reversed(list(enumerate(terms, 1)))}
+        alts = "|".join(re.escape(t) for t in sorted(index, key=len, reverse=True))
+        rules.append((re.compile(alts, re.I), lambda m: f"[지정어-{index[m.group().lower()]}]"))
+    hits = 0
+    for pattern, label in rules:
+        def replace(m):
+            nonlocal hits
+            if label == "[계좌번호]" and sum(c.isdigit() for c in m.group()) < 10:  # 날짜(2026-11-12) 등
+                return m.group()
+            hits += 1
+            return label(m) if callable(label) else label
+        text = pattern.sub(replace, text)
+    return text, hits
+
+
 def mask_secrets(text):
-    # ponytail: 흔한 패턴만 가린다. 형식 없는 비밀값은 못 막으며 README에 한계를 적는다
-    return SECRET.sub("[비밀값 가림]", text)
+    return redact(text, None)[0]
 
 
 def _clip(s, n, tail=False):
-    s = " ".join(mask_secrets(s).split())
+    s = " ".join(s.split())
     if len(s) <= n:
         return s
     return "…" + s[1 - n:] if tail else s[: n - 1] + "…"
 
 
-def render_turn(turn, now):
-    lines = ["", f"## {now:%Y-%m-%d %H:%M} turn", f"**요청:** {_clip(turn['prompt'], 400)}"]
-    if turn["reply"]:
-        lines.append(f"**결과:** {_clip(turn['reply'], 600, tail=True)}")  # 결론은 끝에 있다
-    if turn["files"]:
-        lines.append("**변경:** " + ", ".join(turn["files"]))
+def render_turn(turn, now, secure=None, session=None):
+    """가린 뒤에 자른다. 잘린 비밀값 조각은 패턴에 걸리지 않는다."""
+    prompt, a = redact(turn["prompt"], secure)
+    reply, b = redact(turn["reply"], secure)
+    files, c = redact(", ".join(turn["files"]), secure)
+    tag = f" session={session[:8]}" if session else ""
+    lines = ["", f"## {now:%Y-%m-%d %H:%M} turn{tag}", f"**요청:** {_clip(prompt, 400)}"]
+    if reply:
+        lines.append(f"**결과:** {_clip(reply, 600, tail=True)}")  # 결론은 끝에 있다
+    if files:
+        lines.append("**변경:** " + files)
     if turn["tools"]:
         lines.append("**도구:** " + ", ".join(dict.fromkeys(turn["tools"])))
+    if secure and a + b + c:
+        lines.append(f"**보안:** {a + b + c}건 가림")
     return "\n".join(lines) + "\n"
 
 
@@ -250,29 +331,58 @@ def decide_checkpoint(cfg, sess, tokens):
     return "checkpoint+clear" if over else "checkpoint"
 
 
-def checkpoint_reason(root, recommend_clear):
+# 저장된 파일은 훅이 가린 뒤라 원문으로 Edit하면 실패한다 (2026-11-12 실측: Edit 4번 실패 후 다시 씀)
+SECURE_WRITER_NOTE = ("보안 모드: 기밀 문서 본문은 옮기지 말고 파일 경로·절 위치로 가리키며, 회사·고객·사람 이름은 역할로 씁니다. "
+                      "저장할 때 훅이 개인정보와 지정어를 자동으로 가리므로, 저장한 뒤 다시 고치지 마세요.")
+
+
+def pending_path(root, session=None):
+    """세션마다 따로 둔다. 같은 폴더의 다른 터미널이 남의 체크포인트를 자기 이름으로 옮기지 않게."""
+    return root / DIR / (f".pending-checkpoint-{session[:8]}.md" if session and session != "?" else PENDING)
+
+
+def checkpoint_reason(root, recommend_clear, session=None):
     """화면에 그대로 보이므로 짧게 쓴다."""
     lines = [
-        f"leneu-session 체크포인트 시점입니다. 다른 작업 없이 {root / DIR / PENDING} 하나만 Write로 쓰고 "
+        f"leneu-session 체크포인트 시점입니다. 다른 작업 없이 {pending_path(root, session)} 하나만 Write로 쓰고 "
         "'체크포인트 저장'이라고만 답하세요.",
         "### 헤더로 아래 순서대로, 해당 없는 항목은 빼고 6000자 이내, 비밀값 없이 씁니다: "
         "현재 작업의 요구와 사용자 정정(원문 그대로. 이전 체크포인트의 원문도 잇되 끝난 작업 것은 뺌) / "
-        "확인된 사실(경로·명령·값·에러) / 변경 파일과 검증 여부 / 결정(고른 것, 버린 것, 이유) / "
+        "확인된 사실(경로·명령·값·에러) / 서브에이전트 결과(결론·근거 파일·아직 반영 안 한 것) / "
+        "변경 파일과 검증 여부 / 결정(고른 것, 버린 것, 이유) / "
         "막다른 길(실패한 시도와 이유) / 완료 기준(무엇이 되면 끝인가) / 다음 액션(1~3개, 파일 경로 포함)",
     ]
+    if load_secure(root):
+        lines.append(SECURE_WRITER_NOTE)
     if recommend_clear:
         lines.append("답 끝에 '컨텍스트가 커졌습니다. 작업이 일단락되면 /clear를 권합니다.'를 붙이세요.")
     return "\n".join(lines)
 
 
-def consume_pending(root, tokens, session_id, transcript_path, now):
-    """모델이 쓴 임시 파일을 로그로 옮긴다. 헤더와 시각은 훅이 붙인다."""
-    pending = root / DIR / PENDING
-    if not pending.exists():
+def _demote(body):
+    """모델이 쓴 #, ## 헤더를 ###로 내린다. 코드 블록 안은 그대로 두되 로그 헤더 모양만 깬다."""
+    out, fence = [], False
+    for line in body.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif fence:
+            line = " " + line if HEADER.match(line) else line
+        else:
+            line = re.sub(r"^#{1,2} ", "### ", line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def consume_pending(root, tokens, session_id, transcript_path, now, pending=None):
+    """모델이 쓴 임시 파일을 로그로 옮긴다. 헤더와 시각은 훅이 붙인다.
+    자기 세션의 파일을 먼저, 없으면 세션 없는 예전 이름의 파일을 옮긴다."""
+    if pending is None:
+        pending = next((p for p in (pending_path(root, session_id), root / DIR / PENDING) if p.exists()), None)
+    if pending is None or not pending.exists():
         return False
     body = pending.read_text(errors="replace").strip()
     if body:
-        body = mask_secrets(re.sub(r"^#{1,2} ", "### ", body, flags=re.M))
+        body = redact(_demote(body), load_secure(root))[0]
         append_log(root, (
             f"\n## {now:%Y-%m-%d %H:%M} checkpoint tokens={tokens or '?'} session={session_id[:8]}\n"
             + (f"**원본:** {transcript_path}\n" if transcript_path else "")
@@ -309,12 +419,12 @@ def on_stop(data):
 
     output = None
     try:
-        if not active:
-            _record_turns(root, entries, sess, message, now)
+        # 체크포인트 지시는 첨부로 들어와 턴이 아니다. 그 사이 사용자가 입력한 메시지는 여기서 남겨야 한다
+        _record_turns(root, entries, sess, message, now, sid)
 
         tokens = context_tokens(entries)
         consume_pending(root, tokens, sid, transcript, now)
-        handoff = latest_handoff(root)
+        handoff = latest_handoff(root, _lineage(root, sid, state))
         handoff_id = str(handoff[1]) + str(handoff[1].stat().st_mtime) if handoff else None
 
         if tokens is not None:
@@ -327,13 +437,19 @@ def on_stop(data):
                 sess["last_ckpt"] = tokens
             elif not active and not is_noninteractive(_entrypoint()):
                 action = decide_checkpoint(load_config(root), sess, tokens)
+                # 서브에이전트가 도는 중이면 결과가 빠진 체크포인트가 되고, /clear하면 결과를 받을 세션이 사라진다
+                if action != "none" and running_tasks(entries) and sess.get("deferred", 0) < MAX_DEFER:
+                    sess["deferred"] = sess.get("deferred", 0) + 1
+                    action = "none"
+                elif action != "none":
+                    sess.pop("deferred", None)
                 if action != "none":
                     sess["last_ckpt"] = tokens
                     sess["recommended"] = sess.get("recommended") or action == "checkpoint+clear"
                     # decision: block은 transcript에 오류로 남아 모델이 체크포인트에 오류라고 적는다
                     output = {"hookSpecificOutput": {
                         "hookEventName": "Stop",
-                        "additionalContext": checkpoint_reason(root, action == "checkpoint+clear"),
+                        "additionalContext": checkpoint_reason(root, action == "checkpoint+clear", sid),
                     }}
     finally:  # 커서를 못 남기면 다음 Stop마다 같은 턴이 다시 쌓이고 같은 오류가 반복된다
         _move_cursor(entries, sess)
@@ -342,12 +458,13 @@ def on_stop(data):
         print(json.dumps(output, ensure_ascii=False))
 
 
-def _record_turns(root, entries, sess, message, now):
+def _record_turns(root, entries, sess, message, now, sid=None):
     turns = _new_turns(entries, sess.get("cursor"))
     if turns and message and message.strip() not in turns[-1]["reply"]:
         turns[-1]["reply"] = (turns[-1]["reply"] + "\n\n" + message.strip()).strip()
+    secure = load_secure(root)
     for turn in turns:
-        append_log(root, render_turn(turn, now), now)
+        append_log(root, render_turn(turn, now, secure, sid), now)
 
 
 def _move_cursor(entries, sess):
@@ -368,7 +485,11 @@ def on_session_end(data):
     sess = state.pop(sid, {})
     state[sid] = sess
     try:
-        _record_turns(root, entries, sess, None, datetime.now())
+        _record_turns(root, entries, sess, None, datetime.now(), sid)
+        # 체크포인트를 쓰자마자 끝내면 옮길 Stop이 없다. 다음 세션이 옮기면 주인을 모른다
+        consume_pending(root, context_tokens(entries), sid, data.get("transcript_path"), datetime.now())
+        if data.get("reason") == "clear":  # 바로 뒤 SessionStart(clear)가 이 세션의 기록을 고르게 한다
+            (root / DIR / ".cleared").write_text(sid)
     finally:
         _move_cursor(entries, sess)
         save_state(root, state)
@@ -390,33 +511,46 @@ def _log_files(root):
     return sorted((root / DIR / "logs").glob("*.md"))
 
 
-def latest_checkpoint(root):
+def _of_session(body, sessions):
+    """같은 폴더를 터미널 여러 개로 쓸 때 다른 터미널의 기록을 거른다. sessions는 이 터미널에서 이어진 세션들이다.
+    표시가 없는 예전 기록은 통과시킨다."""
+    if not sessions:
+        return True
+    tag = _tag(body)
+    return not tag or tag in {s[:8] for s in sessions}
+
+
+def latest_checkpoint(root, session=None):
     for path in reversed(_log_files(root)):
-        found = [s for s in _sections(path.read_text(errors="replace")) if s[1] == "checkpoint"]
+        found = [s for s in _sections(path.read_text(errors="replace"))
+                 if s[1] == "checkpoint" and _of_session(s[2], session)]
         if found:
             return found[-1][0], found[-1][2], path
     return None
 
 
-def latest_handoff(root):
+def latest_handoff(root, sessions=None):
     """수동 인계 문서 중 최신. 시각은 로그 헤더와 비교하도록 분 단위로 맞춘다."""
-    files = list((root / DIR / "handoffs").glob("handoff-*.md"))
+    ids = {s[:8] for s in sessions or ()}
+    files = [p for p in (root / DIR / "handoffs").glob("handoff-*.md")
+             if not ids or not HANDOFF_TAG.match(p.name) or HANDOFF_TAG.match(p.name).group(1) in ids]
     if not files:
         return None
     path = max(files, key=lambda p: p.stat().st_mtime)
     return datetime.fromtimestamp(path.stat().st_mtime).replace(second=0, microsecond=0), path
 
 
-def _latest_source(root):
-    """복귀에 쓸 최신 기록: (시각, 본문, 경로). 같은 분이면 사람이 요청한 handoff가 우선이다."""
-    checkpoint = latest_checkpoint(root)
-    handoff = latest_handoff(root)
+def _latest_source(root, session=None):
+    """복귀에 쓸 최신 기록: (시각, 본문, 경로). 같은 분이면 사람이 요청한 handoff가 우선이다.
+    세션을 알면 그 세션의 체크포인트를, 없으면 가장 최근 것을 쓴다."""
+    checkpoint = (latest_checkpoint(root, session) if session else None) or latest_checkpoint(root)
+    handoff = latest_handoff(root, session)
     if handoff and (not checkpoint or handoff[0] >= checkpoint[0]):
         return handoff[0], handoff[1].read_text(errors="replace"), handoff[1]
     return checkpoint
 
 
-def turns_after(root, since):
+def turns_after(root, since, session=None):
     """같은 분에 쓰인 턴은 포함한다. 잃는 것보다 한 줄 겹치는 쪽이 낫다."""
     files = _log_files(root)
     if since is None:
@@ -426,19 +560,68 @@ def turns_after(root, since):
     out = []
     for path in files:
         for dt, kind, body in _sections(path.read_text(errors="replace")):
-            if kind == "turn" and (since is None or dt >= since):
+            if kind == "turn" and (since is None or dt >= since) and _of_session(body, session):
                 out.append(body)
     return "\n\n".join(out)
 
 
-def build_context(root, source, now):
+def _tag(body):
+    """기록의 세션 표시. 주인을 모르는 기록(session=?)은 표시 없음으로 본다. 놓치는 것보다 낫다."""
+    m = re.search(r"session=([^\s?]\S*)", body.split("\n", 1)[0])
+    return m.group(1) if m else None
+
+
+def _gist(body):
+    """기록 한 줄 요약. 다음 액션의 첫 줄, 없으면 첫 내용 줄."""
+    lines = [l.strip() for l in body.splitlines()[1:] if l.strip() and not l.startswith("**원본")]
+    for i, line in enumerate(lines):
+        if line.startswith("### 다음 액션") and i + 1 < len(lines):
+            return _clip(lines[i + 1], 120)
+    return _clip(next((l for l in lines if not l.startswith("#")), ""), 120)
+
+
+def _chains(root):
+    """세션 표시(8자) → 그 터미널 줄기의 첫 세션 표시. 상태에 없는 세션은 혼자 한 줄기다."""
+    state = load_state(root)
+    full = {k[:8]: k for k in state}
+
+    def chain(tag):
+        return (_lineage(root, full.get(tag), state) or [tag])[-1][:8]
+    return chain, list(full)
+
+
+def _record_tag(body, path):
+    m = HANDOFF_TAG.match(path.name) if path else None
+    return _tag(body) or (m.group(1) if m else None)
+
+
+def other_work(root, mine, now):
+    """새로 시작한 세션은 어느 터미널을 이을지 모른다. 다른 줄기의 최근 24시간 체크포인트를 (시각, 표시, 요약)으로 준다."""
+    chain, _ = _chains(root)
+    latest = {}
+    for path in _log_files(root)[-2:]:
+        for dt, kind, body in _sections(path.read_text(errors="replace")):
+            tag = _tag(body)
+            if kind == "checkpoint" and tag and (now - dt).total_seconds() <= 24 * 3600:
+                latest[chain(tag)] = (dt, tag, _gist(body))
+    own = chain(mine) if mine else None
+    return sorted(v for k, v in latest.items() if k != own)
+
+
+def build_context(root, source, now, session=None):
     if source not in ("clear", "startup", "compact"):
         return None
-    latest = _latest_source(root)
+    if session and not latest_checkpoint(root, session) and not latest_handoff(root, session):
+        session = None  # 체크포인트를 남긴 적 없는 세션이면 가장 최근 기록과 그 뒤 모든 턴을 쓴다
+    latest = _latest_source(root, session)
     if source == "compact" and not latest:
         return None  # 턴 기록은 압축 요약이 이미 담고 있다
     since, body, path = latest or (None, "", None)
-    turns = turns_after(root, since)
+    mine = _record_tag(body, path)
+    if not session and mine:  # 이 터미널을 모를 때도 고른 기록과 같은 줄기의 턴만 붙인다
+        chain, tags = _chains(root)
+        session = {t for t in tags if chain(t) == chain(mine)} | {mine}
+    turns = turns_after(root, since, session)
     if not body and not turns:
         return None
     path = path or _log_files(root)[-1]
@@ -460,6 +643,12 @@ def build_context(root, source, now):
         guidance += f"\n작성 시각: {written:%Y-%m-%d %H:%M}."
         if (now - written).total_seconds() > 24 * 3600:
             guidance += " 하루 이상 지난 기록이니 이어갈지 먼저 사용자에게 물어보세요."
+        others = other_work(root, mine, now)
+        if others:
+            guidance += "\n같은 폴더의 다른 터미널에서 하던 작업도 있습니다(최근 24시간):\n" + "".join(
+                f"- {dt:%m-%d %H:%M} session={tag}: {gist}\n" for dt, tag, gist in others
+            ) + ("사용자가 '.'처럼 짧게만 입력했다면 아래 기록과 위 작업 중 어느 작업을 이을지 먼저 물어보세요. "
+                 "다른 작업의 기록은 로그에서 session=표시로 찾습니다.")
 
     # 다음 액션은 체크포인트 끝에 있어 앞뒤를 모두 남기고, 이후 턴 자리도 남긴다
     limit = MAX_INJECT - min(len(turns), TURNS_ROOM)
@@ -480,7 +669,7 @@ def is_allowed_write(root, file_path):
     if not file_path:
         return False
     path = Path(file_path).resolve()
-    if path == root / DIR / PENDING:
+    if path == root / DIR / PENDING or (path.parent == root / DIR and PENDING_OF.match(path.name)):
         return True
     return path.parent == root / DIR / "handoffs" and fnmatch(path.name, "handoff-*.md")
 
@@ -518,8 +707,9 @@ def ensure_worktree(cwd):
     if not (main / DIR).is_dir() or (main / DIR / "disabled").exists():
         return None
     _create_folder(target)
-    if (main / DIR / "config.json").exists():
-        shutil.copy(main / DIR / "config.json", target / DIR / "config.json")
+    for name in ("config.json", "secure.json"):
+        if (main / DIR / name).exists():
+            shutil.copy(main / DIR / name, target / DIR / name)
     return target
 
 
@@ -537,11 +727,49 @@ def new_errors(root):
     return f"leneu-session 훅 오류 {len(lines)}건 (hook-errors.old.log). 마지막: {lines[-1][:200]}"
 
 
+def prune_logs(root, cfg, now):
+    """keep_log_days가 0이면(기본) 지우지 않는다."""
+    days = cfg["keep_log_days"]
+    if not days:
+        return
+    cutoff = f"{now - timedelta(days=days):%Y-%m-%d}"
+    for path in _log_files(root):
+        if path.stem < cutoff:
+            path.unlink()
+
+
 def _recover_pending(root):
-    """Stop 전에 끊긴 세션의 체크포인트. 쓰인 시각으로 넣고, 어느 세션 것인지 모르니 적지 않는다."""
-    pending = root / DIR / PENDING
-    if pending.exists():
-        consume_pending(root, None, "?", None, datetime.fromtimestamp(pending.stat().st_mtime))
+    """비정상 종료로 남은 체크포인트. 쓰인 시각으로 넣고, 주인은 파일 이름에서 찾는다(모르면 ?)."""
+    for pending in (root / DIR).glob(".pending-checkpoint*.md"):
+        owner = PENDING_OF.match(pending.name)
+        consume_pending(root, None, owner.group(1) if owner else "?", None,
+                        datetime.fromtimestamp(pending.stat().st_mtime), pending)
+
+
+def _lineage(root, sid, state=None, limit=10):
+    """이 세션과, /clear로 거슬러 올라가는 이전 세션들. 짧게 쓰고 지운 세션도 앞 세션의 기록을 잇게 한다."""
+    state, out = load_state(root) if state is None else state, []
+    while sid and sid not in out and len(out) < limit:
+        out.append(sid)
+        sid = (state.get(sid) or {}).get("from")
+    return out or None
+
+
+def _closing_session(root, data):
+    """이 터미널의 세션들. /clear면 방금 닫힌 세션부터, 압축이면 지금 세션부터. 새로 시작하면 모른다."""
+    cleared = root / DIR / ".cleared"
+    closed = cleared.read_text().strip() if cleared.exists() else None
+    cleared.unlink(missing_ok=True)
+    source, sid = data.get("source"), data.get("session_id")
+    if source == "compact":
+        return _lineage(root, sid)
+    if source != "clear" or not closed:
+        return None
+    if sid:
+        state = load_state(root)
+        state.setdefault(sid, {})["from"] = closed
+        save_state(root, state)
+    return _lineage(root, closed)
 
 
 def on_session_start(data):
@@ -554,14 +782,18 @@ def on_session_start(data):
     output = {}
     try:
         _recover_pending(root)
-        context = build_context(root, data.get("source"), datetime.now())
+        prune_logs(root, load_config(root), datetime.now())
+        context = build_context(root, data.get("source"), datetime.now(), _closing_session(root, data))
         if context:
             output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
     except Exception as e:  # /clear에서 기록을 못 넣었다면 지금 알려야 한다
         log_error(root, e)
-    errors = new_errors(root)
-    if errors:
-        output["systemMessage"] = errors
+    secure = load_secure(root)
+    notes = [new_errors(root)]
+    if secure:
+        notes.append(f"leneu-session 보안 모드 켜짐 (지정어 {len(secure['terms'])}개). 끄기: /leneu-session:leneu-secure off")
+    if any(notes):
+        output["systemMessage"] = "\n".join(n for n in notes if n)
     if output:
         print(json.dumps(output, ensure_ascii=False))
 
@@ -582,12 +814,22 @@ def on_pre_tool_use(data):
     root = find_root(data.get("cwd"))
     if root is None or data.get("tool_name") != "Write":
         return
-    if is_allowed_write(root, (data.get("tool_input") or {}).get("file_path")):
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "permissionDecisionReason": "leneu-session 기록",
-        }}, ensure_ascii=False))
+    tool_input = data.get("tool_input") or {}
+    if not is_allowed_write(root, tool_input.get("file_path")):
+        return
+    out = {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "leneu-session 기록"}
+    secure = load_secure(root)
+    if secure and isinstance(tool_input.get("content"), str):
+        content, hits = redact(tool_input["content"], secure)
+        out["updatedInput"] = dict(tool_input, content=content)
+        marks = list(dict.fromkeys(m.group() for m in CONFIDENTIAL.finditer(content)))
+        if marks:  # 무엇을 가려야 할지 패턴으로는 모른다. 사람이 보고 정한다
+            out["permissionDecision"] = "ask"
+            out["permissionDecisionReason"] = (
+                f"leneu-session 보안 모드: 기밀 표시({', '.join(marks)})가 있는 기록입니다. "
+                f"자동으로 {hits}건 가렸습니다. 이대로 저장할까요?"
+            )
+    print(json.dumps({"hookSpecificOutput": out}, ensure_ascii=False))
 
 
 def _project_dir(cwd):
@@ -595,18 +837,38 @@ def _project_dir(cwd):
     start = Path(cwd or os.getcwd()).resolve()
     home = Path.home().resolve()
     for d in (start, *start.parents):
+        if d == home:  # 홈의 폴더를 집어 들면 하위 전체가 켜진다
+            break
         if (d / DIR).is_dir() or (d / ".git").exists():
             return d
-        if d == home:
-            break
     return start
+
+
+HOME_REFUSAL = "홈 폴더에서는 쓰지 않습니다. 하위의 모든 폴더에 적용되기 때문입니다. 프로젝트 폴더에서 실행하세요."
+
+
+def _manual_folder(cwd):
+    """수동 명령(handoff, brief)용 폴더. 없으면 만들되 자동 기록은 켜지 않는다. 홈이면 None."""
+    target = _project_dir(cwd)
+    if target == Path.home().resolve():
+        return None
+    folder = target / DIR
+    if not folder.is_dir():
+        _create_folder(target)
+        (folder / "disabled").touch()  # 인계만 요청한 것이다. 자동 기록은 /leneu-init으로 켠다
+    return folder
+
+
+def cli_brief_path(cwd):
+    folder = _manual_folder(cwd)
+    return str(folder / "project-brief.md") if folder else HOME_REFUSAL
 
 
 def cli_init(cwd):
     target = _project_dir(cwd)
     folder = target / DIR
-    if target == Path.home().resolve() and not folder.is_dir():
-        return "홈 폴더에서는 켜지 않습니다. 하위의 모든 폴더에 적용되기 때문입니다. 프로젝트 폴더에서 실행하세요."
+    if target == Path.home().resolve():
+        return HOME_REFUSAL
     existed = folder.is_dir()
     disabled = (folder / "disabled").exists()
     _create_folder(target)
@@ -619,21 +881,25 @@ def cli_init(cwd):
     return f"leneu-session을 켰습니다: {folder}\n훅은 다음 턴부터 기록합니다."
 
 
-def cli_handoff_path(cwd, now):
+HANDOFF_TAG = re.compile(r"^handoff-\d{8}-\d{4}-(\w{8})\.md$")
+
+
+def cli_handoff_path(cwd, now, session=None):
     """새 handoff 경로를 정해 준다. 시각을 모델이 짐작하지 않게 하고, 새 문서 자리를 비운다."""
-    target = _project_dir(cwd)
-    folder = target / DIR
-    if not folder.is_dir():
-        _create_folder(target)
-        (folder / "disabled").touch()  # 인계만 요청한 것이다. 자동 기록은 /leneu-init으로 켠다
+    folder = _manual_folder(cwd)
+    if folder is None:
+        return HOME_REFUSAL
     handoffs = folder / "handoffs"
     handoffs.mkdir(exist_ok=True)
     old = sorted(handoffs.glob("handoff-*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[MAX_HANDOFFS - 1:]
     for p in old:
         p.unlink()
-    lines = [str(handoffs / f"handoff-{now:%Y%m%d-%H%M}.md")]
+    tag = f"-{session[:8]}" if session else ""  # 같은 폴더의 다른 터미널 것과 구분한다
+    lines = [str(handoffs / f"handoff-{now:%Y%m%d-%H%M}{tag}.md")]
     if old:
         lines.append(f"오래된 handoff {len(old)}개를 지웠습니다.")
+    if load_secure(folder.parent):
+        lines.append(SECURE_WRITER_NOTE)
     return "\n".join(lines)
 
 
@@ -646,6 +912,41 @@ def cli_stop(cwd):
         f"leneu-session을 껐습니다: {folder}\n기록은 그대로 남아 있습니다. "
         "다시 켜려면 /leneu-init, 완전히 지우려면 폴더를 직접 삭제하세요."
     )
+
+
+SECURE_USAGE = ("사용법: /leneu-session:leneu-secure [on | off | add 단어, 단어 | remove 단어 | list]\n"
+                "지정어는 쉼표로 나눕니다. 예: add 회사명, 고객사, 프로젝트 코드명")
+
+
+def cli_secure(cwd, args):
+    folder = _project_dir(cwd) / DIR
+    if not folder.is_dir() or (folder / "disabled").exists():
+        return "이 프로젝트에서 leneu-session이 켜져 있지 않습니다. 먼저 /leneu-init 으로 켜세요."
+    root = folder.parent
+    secure = load_secure(root, any_state=True)
+    cmd, _, rest = (args or "").strip().partition(" ")
+    words = [w.strip() for w in rest.split(",") if w.strip()]
+    cmd = cmd.lower() or "on"
+    if cmd == "on":
+        secure["enabled"] = True
+    elif cmd == "off":
+        secure["enabled"] = False
+    elif cmd == "add":
+        secure["terms"] += [w for w in words if w.lower() not in {t.lower() for t in secure["terms"]}]
+    elif cmd == "remove":
+        drop = {w.lower() for w in words}
+        secure["terms"] = [t for t in secure["terms"] if t.lower() not in drop]
+    elif cmd not in ("list", "status"):
+        return SECURE_USAGE
+    (folder / "secure.json").write_text(json.dumps(secure, ensure_ascii=False, indent=1))
+
+    terms = ", ".join(secure["terms"]) or "없음"
+    if cmd == "on":
+        return ("보안 모드를 켰습니다. 기록에서 이메일·전화번호·주민/카드/계좌번호·내부 IP와 주소·긴 토큰, "
+                f"지정어를 가리고, 기밀 표시가 있는 체크포인트는 저장 전에 묻습니다.\n지정어: {terms}\n{SECURE_USAGE}")
+    if cmd == "off":
+        return f"보안 모드를 껐습니다. 다음 턴부터 평소대로 기록합니다. 지정어({terms})는 다시 켤 때를 위해 남겨 둡니다."
+    return f"보안 모드: {'켜짐' if secure['enabled'] else '꺼짐'}\n지정어: {terms}"
 
 
 HANDLERS = {
@@ -721,7 +1022,7 @@ def test_find_root_none_when_disabled():
 
 def test_load_config_defaults():
     cfg = load_config(_project())
-    assert cfg == {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 5}
+    assert cfg == {"context_window": 1000000, "clear_recommend_pct": 30, "checkpoint_every_pct": 5, "keep_log_days": 0}
 
 
 def test_load_config_override_keeps_other_defaults():
@@ -939,7 +1240,7 @@ def test_stop_blocks_once_per_interval():
     out = _stop(root, 147000)
     ctx = out["hookSpecificOutput"]["additionalContext"]
     assert out["hookSpecificOutput"]["hookEventName"] == "Stop" and "decision" not in out
-    assert ".pending-checkpoint.md" in ctx and "/clear" not in ctx
+    assert ".pending-checkpoint-s1.md" in ctx and "/clear" not in ctx
     assert _stop(root, 148000) is None  # 다음 턴에 또 재촉하지 않는다
 
 
@@ -980,12 +1281,16 @@ def test_stop_records_all_new_turns_once():
     assert text.count("첫째") == 1 and text.count("둘째") == 1
 
 
-def test_stop_active_does_not_record_turn():
+def test_stop_active_does_not_record_checkpoint_instruction():
     root = _project()
     _stop(root, 47000, prompt="기록됨")
-    _stop(root, 47000, active=True, prompt="체크포인트지시")
+    t = root / "t-s1.jsonl"
+    hook = {"type": "attachment", "uuid": "h1", "attachment": {"type": "hook_additional_context", "content": ["체크포인트지시"]}}
+    with t.open("a") as f:  # 실제로는 첨부로 들어온다 (2026-11-12 transcript 확인)
+        f.write(json.dumps(hook) + "\n" + json.dumps(dict(_assistant("체크포인트 저장", usage=USAGE), uuid="a8")) + "\n")
+    _capture(on_stop, {"cwd": str(root), "session_id": "s1", "transcript_path": str(t), "stop_hook_active": True})
     text = _log_text(root)
-    assert "기록됨" in text and "체크포인트지시" not in text
+    assert "기록됨" in text and "체크포인트지시" not in text and "체크포인트 저장" not in text
 
 
 def test_stop_without_usage_records_turn_without_block():
@@ -1679,6 +1984,380 @@ def test_render_turn_keeps_end_of_reply():
     assert res.endswith("최종결과") and len(res) <= 610
 
 
+# ---- 백그라운드 작업 대기
+
+def _launch(tid, text="Async agent launched successfully.\nagentId: x"):
+    """text가 리스트면 블록 목록으로, 문자열이면 그대로 결과 내용으로 쓴다 (실제 기록에 둘 다 있다)."""
+    return {"type": "user", "uuid": "L" + tid,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tid, "content": text}]}}
+
+
+def _notify(tid, status="completed"):
+    prompt = f"<task-notification>\n<task-id>x</task-id>\n<tool-use-id>{tid}</tool-use-id>\n<status>{status}</status>\n</task-notification>"
+    return {"type": "attachment", "uuid": "N" + tid, "attachment": {"type": "queued_command", "prompt": prompt}}
+
+
+def test_running_tasks_matches_launch_and_notification():
+    entries = [_launch("t1"), _launch("t2"), _notify("t1"), _launch("t3", "일반 결과"),
+               _launch("b1", "Command running in background with ID: b1."),  # 개발 서버 등은 기다리지 않는다
+               _launch("t4", [{"type": "text", "text": "Async agent launched successfully."}])]
+    assert running_tasks(entries) == {"t2", "t4"}
+    assert running_tasks(entries + [_notify("t2", "failed"), _notify("t4", "killed")]) == set()
+
+
+def _stop_with(root, tokens, extra=(), sid="s1"):
+    t = root / f"t-{sid}.jsonl"
+    with t.open("a") as f:
+        for e in extra:
+            f.write(json.dumps(e) + "\n")
+    return _stop(root, tokens, sid=sid)
+
+
+def test_stop_defers_checkpoint_until_background_tasks_finish():
+    root = _project()
+    _stop(root, 250000)
+    assert _stop_with(root, 350000, [_launch("t1")]) is None  # 서브에이전트가 도는 중
+    assert "recommended" not in load_state(root)["s1"]
+    ctx = _stop_with(root, 351000, [_notify("t1")])["hookSpecificOutput"]["additionalContext"]
+    assert "/clear" in ctx
+
+
+def test_stop_stops_waiting_for_tasks_that_never_report():
+    root = _project()
+    _stop(root, 47000)
+    _stop_with(root, 200000, [_launch("t1")])
+    outs = [_stop(root, 200000 + i) for i in range(MAX_DEFER)]
+    assert outs[-1] is not None and all(o is None for o in outs[:-1])
+
+
+def test_checkpoint_reason_asks_for_subagent_results():
+    assert "서브에이전트 결과" in checkpoint_reason(_project(), False)
+
+
+# ---- 턴 도중 입력
+
+def _queued(text):
+    return {"type": "attachment", "uuid": "q" + text[:6], "attachment": {"type": "queued_command", "prompt": text}}
+
+
+def test_parse_turns_records_prompts_typed_mid_turn():
+    turns = parse_turns([_user("첫 요청"), _assistant("작업 중"), _queued("이것도 같이 해줘"),
+                         _notify("t1"), _assistant("둘 다 함")])
+    assert [t["prompt"] for t in turns] == ["첫 요청", "이것도 같이 해줘"]
+    assert turns[1]["reply"] == "둘 다 함"
+
+
+def test_stop_records_prompt_typed_during_checkpoint():
+    root = _project()
+    _stop(root, 47000, prompt="앞요청")
+    t = root / "t-s1.jsonl"
+    with t.open("a") as f:
+        f.write(json.dumps(dict(_queued("체크포인트중입력"), uuid="q1")) + "\n")
+        f.write(json.dumps(dict(_assistant("체크포인트 저장", usage=USAGE), uuid="a9")) + "\n")
+    _capture(on_stop, {"cwd": str(root), "session_id": "s1", "transcript_path": str(t), "stop_hook_active": True})
+    _stop(root, 47000, prompt="뒷요청")
+    text = _log_text(root)
+    assert text.count("체크포인트중입력") == 1 and text.count("앞요청") == 1
+
+
+# ---- 로그 정리
+
+def test_session_start_deletes_logs_older_than_keep_days():
+    root = _project()
+    for d in ["2026-08-01", "2026-10-20", "2026-11-09"]:
+        _write_log(root, d, TURN)
+    _capture(on_session_start, {"cwd": str(root), "source": "startup"})
+    assert len(_log_files(root)) == 3  # 기본은 지우지 않는다
+    (root / ".leneu-session" / "config.json").write_text('{"keep_log_days": 30}')
+    assert load_config(root)["keep_log_days"] == 30
+    prune_logs(root, load_config(root), NOW)
+    assert [p.stem for p in _log_files(root)] == ["2026-10-20", "2026-11-09"]
+
+
+# ---- 작은 결함
+
+def _fake_home(fn):
+    home = _project().parent / ("home" + os.urandom(3).hex())
+    home.mkdir()
+    old = os.environ["HOME"]
+    os.environ["HOME"] = str(home)
+    try:
+        return fn(home)
+    finally:
+        os.environ["HOME"] = old
+
+
+def test_handoff_and_init_never_enable_home():
+    def run(home):
+        out = cli_handoff_path(str(home), datetime(2026, 11, 20))
+        assert not (home / ".leneu-session").exists() and "홈" in out
+        (home / ".leneu-session").mkdir()  # 예전 버전이 만들어 둔 폴더
+        assert find_root(str(home)) is None  # 꺼짐 표시가 없어도 홈은 기록하지 않는다
+        (home / ".leneu-session" / "disabled").touch()
+        (home / "proj").mkdir()
+        assert "홈" in cli_init(str(home)) and "홈" in cli_brief_path(str(home))
+        cli_init(str(home / "proj"))  # 홈이 아니라 그 폴더에서 켜진다
+        assert (home / ".leneu-session" / "disabled").exists() and find_root(str(home / "proj")) == home / "proj"
+    _fake_home(run)
+
+
+def test_brief_path_points_to_project_root_from_subfolder():
+    d = Path(tempfile.mkdtemp()).resolve()
+    (d / ".git").mkdir()
+    (d / "src" / "deep").mkdir(parents=True)
+    assert cli_brief_path(str(d / "src" / "deep")) == str(d / ".leneu-session" / "project-brief.md")
+    assert (d / ".leneu-session" / "disabled").exists() and not (d / "src" / ".leneu-session").exists()
+
+
+def test_consume_pending_keeps_code_blocks():
+    root = _project()
+    pending = root / ".leneu-session" / ".pending-checkpoint.md"
+    pending.write_text("## 제목\n```bash\n# 설치\n## 2026-11-09 10:00 turn\n```\n# 밖\n")
+    consume_pending(root, 1, "s", "t", datetime(2026, 11, 9))
+    body = _log_text(root).split("**원본:** t\n")[1]
+    assert "### 제목" in body and "\n# 설치\n" in body and "### 밖" in body
+    assert len(list(_sections(_log_text(root)))) == 1  # 코드 블록 속 가짜 헤더는 절을 만들지 않는다
+
+
+# ---- 보안 모드
+
+def _secure(root, terms=()):
+    (root / ".leneu-session" / "secure.json").write_text(json.dumps({"enabled": True, "terms": list(terms)}))
+    return load_secure(root)
+
+
+def test_redact_hides_personal_and_internal_values():
+    s = {"enabled": True, "terms": ["ACME", "프로젝트 블루"]}
+    cases = {
+        "kim.lee@acme-corp.co.kr": "[이메일]", "010-1234-5678": "[전화번호]", "+82 10-1234-5678": "[전화번호]",
+        "900101-1234567": "[주민번호]", "1234-5678-9012-3456": "[카드번호]", "110-123-456789": "[계좌번호]",
+        "192.168.0.12": "[내부IP]", "10.2.3.4": "[내부IP]", "https://wiki.corp/x/y": "[내부주소]",
+        "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY": "[토큰]", "sk-ant-abc123def456ghi": "[비밀값 가림]",
+    }
+    for raw, label in cases.items():
+        out, n = redact(f"값은 {raw} 입니다", s)
+        assert raw not in out and label in out and n == 1, (raw, out)
+    out, n = redact("acme와 프로젝트 블루, 다시 ACME", s)
+    assert out == "[지정어-1]와 [지정어-2], 다시 [지정어-1]" and n == 3
+
+
+def test_redact_keeps_ordinary_text():
+    s = {"enabled": True, "terms": []}
+    text = ("2026-11-12 14:30 v0.2.0 0c1ab1c 커밋, 6f74a221-d734-482d-ae53-0900f6f71336, "
+            "/Users/me/proj/scripts/session_hook.py:42, 127.0.0.1:8080, 103/103, https://github.com/a/b, "
+            ".claude/settings.local.json, CLAUDE_CODE_ENTRYPOINT")
+    assert redact(text, s) == (text, 0)
+    assert redact("kim@x.com", None) == ("kim@x.com", 0)  # 보안 모드가 아니면 비밀값만 가린다
+
+
+def test_secure_mode_masks_turn_log_and_checkpoint():
+    root = _project()
+    _secure(root, ["ACME"])
+    _stop(root, 47000, prompt="ACME 담당자 kim@acme.io 에게 보낼 문서")
+    (root / ".leneu-session" / ".pending-checkpoint.md").write_text("### 사실\nACME 계약 010-1111-2222\n")
+    _stop(root, 47000)
+    text = _log_text(root)
+    assert "ACME" not in text and "kim@acme.io" not in text and "010-1111-2222" not in text
+    assert "[지정어-1]" in text and "**보안:**" in text
+
+
+def test_secure_mode_write_masks_input_and_asks_on_confidential_marker():
+    root = _project()
+    _secure(root, ["ACME"])
+    path = str(root / ".leneu-session" / ".pending-checkpoint.md")
+    data = {"cwd": str(root), "tool_name": "Write", "tool_input": {"file_path": path, "content": "ACME 일정"}}
+    out = _capture(on_pre_tool_use, data)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow"
+    assert out["updatedInput"] == {"file_path": path, "content": "[지정어-1] 일정"}
+    data["tool_input"]["content"] = "대외비 자료 요약"
+    out = _capture(on_pre_tool_use, data)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "ask" and "대외비" in out["permissionDecisionReason"]
+
+
+def test_normal_mode_write_is_allowed_unchanged():
+    root = _project()
+    path = str(root / ".leneu-session" / ".pending-checkpoint.md")
+    out = _capture(on_pre_tool_use, {"cwd": str(root), "tool_name": "Write",
+                                     "tool_input": {"file_path": path, "content": "대외비 kim@x.io"}})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "allow" and "updatedInput" not in out["hookSpecificOutput"]
+
+
+def test_secure_checkpoint_reason_says_point_dont_copy():
+    root = _project()
+    assert "보안 모드" not in checkpoint_reason(root, True)
+    _secure(root)
+    r = checkpoint_reason(root, True)
+    assert "보안 모드" in r and len(r) < 800
+
+
+def test_secure_mode_tells_writer_masking_is_automatic():
+    root = _project()
+    assert "다시 고치지" not in cli_handoff_path(str(root), NOW)
+    _secure(root, ["ACME"])
+    assert "다시 고치지" in cli_handoff_path(str(root), NOW) and "다시 고치지" in checkpoint_reason(root, False)
+
+
+def test_cli_secure_toggles_and_manages_terms():
+    root = _project()
+    assert "켰습니다" in cli_secure(str(root), "")
+    assert load_secure(root) == {"enabled": True, "terms": []}
+    cli_secure(str(root), "add ACME, 프로젝트 블루")
+    cli_secure(str(root), "add 홍길동")
+    assert load_secure(root)["terms"] == ["ACME", "프로젝트 블루", "홍길동"]
+    cli_secure(str(root), "remove 프로젝트 블루")
+    assert "ACME" in cli_secure(str(root), "list") and load_secure(root)["terms"] == ["ACME", "홍길동"]
+    assert "껐습니다" in cli_secure(str(root), "off") and load_secure(root) is None
+    assert load_secure(root, any_state=True)["terms"] == ["ACME", "홍길동"]  # 꺼도 목록은 남는다
+    d = Path(tempfile.mkdtemp()).resolve()
+    assert "/leneu-init" in cli_secure(str(d), "")
+
+
+def test_session_start_reminds_secure_mode():
+    root = _project()
+    _secure(root, ["A", "B"])
+    out = _capture(on_session_start, {"cwd": str(root), "source": "startup"})
+    assert "보안 모드" in out["systemMessage"] and "2" in out["systemMessage"]
+
+
+def test_ensure_worktree_copies_secure_settings():
+    main, wt = _worktree()
+    (main / ".leneu-session" / "secure.json").write_text('{"enabled": true, "terms": ["X"]}')
+    ensure_worktree(str(wt))
+    assert load_secure(wt) == {"enabled": True, "terms": ["X"]}
+
+
+# ---- 같은 폴더의 동시 세션
+
+def _two_terminals(root):
+    _write_log(root, "2026-11-09", (
+        "\n## 2026-11-09 14:10 checkpoint tokens=1 session=aaaa1111\n### 다음 액션\nA작업표식\n"
+        "\n## 2026-11-09 14:20 checkpoint tokens=1 session=bbbb2222\n### 다음 액션\nB작업표식\n"
+        "\n## 2026-11-09 14:30 turn session=aaaa1111\n**요청:** A턴표식\n"
+        "\n## 2026-11-09 14:31 turn session=bbbb2222\n**요청:** B턴표식\n"
+        "\n## 2026-11-09 14:32 turn\n**요청:** 옛형식턴표식\n"
+    ))
+
+
+def test_clear_restores_the_closing_sessions_own_record():
+    root = _project()
+    _two_terminals(root)
+    _capture(on_session_end, {"cwd": str(root), "session_id": "aaaa1111-xxxx", "reason": "clear"})
+    out = _capture(on_session_start, {"cwd": str(root), "source": "clear", "session_id": "new"})
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "A작업표식" in ctx and "A턴표식" in ctx and "옛형식턴표식" in ctx
+    assert "B작업표식" not in ctx and "B턴표식" not in ctx
+    assert not (root / ".leneu-session" / ".cleared").exists()  # 한 번만 쓴다
+
+
+def test_clear_falls_back_to_latest_when_session_left_no_checkpoint():
+    root = _project()
+    _two_terminals(root)
+    _capture(on_session_end, {"cwd": str(root), "session_id": "cccc3333", "reason": "clear"})
+    ctx = _capture(on_session_start, {"cwd": str(root), "source": "clear"})["hookSpecificOutput"]["additionalContext"]
+    assert "B작업표식" in ctx
+
+
+def test_clear_follows_the_chain_of_sessions_in_one_terminal():
+    """A → /clear → B(체크포인트 없이 짧게 씀) → /clear. 다른 터미널(B가 아닌 bbbb2222)의 더 새 기록이 아니라 A의 것을 잇는다."""
+    root = _project()
+    _two_terminals(root)
+    _capture(on_session_end, {"cwd": str(root), "session_id": "aaaa1111-x", "reason": "clear"})
+    _capture(on_session_start, {"cwd": str(root), "source": "clear", "session_id": "dddd4444-x"})
+    with (root / ".leneu-session" / "logs" / "2026-11-09.md").open("a") as f:
+        f.write("\n## 2026-11-09 14:40 turn session=dddd4444\n**요청:** D턴표식\n")
+    _capture(on_session_end, {"cwd": str(root), "session_id": "dddd4444-x", "reason": "clear"})
+    out = _capture(on_session_start, {"cwd": str(root), "source": "clear", "session_id": "eeee5555-x"})
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "A작업표식" in ctx and "A턴표식" in ctx and "D턴표식" in ctx
+    assert "B작업표식" not in ctx and "B턴표식" not in ctx
+
+
+def test_restore_ignores_other_terminals_handoff():
+    root = _project()
+    _two_terminals(root)
+    mine = Path(cli_handoff_path(str(root), datetime(2026, 11, 9, 14, 50), "aaaa1111-x").splitlines()[0])
+    other = Path(cli_handoff_path(str(root), datetime(2026, 11, 9, 14, 55), "bbbb2222-x").splitlines()[0])
+    assert mine.name == "handoff-20261109-1450-aaaa1111.md" and is_allowed_write(root, str(mine))
+    _handoff(root, mine.name, "내handoff표식", datetime(2026, 11, 9, 14, 50))
+    _handoff(root, other.name, "남의handoff표식", datetime(2026, 11, 9, 14, 55))
+    _capture(on_session_end, {"cwd": str(root), "session_id": "aaaa1111-x", "reason": "clear"})
+    ctx = _capture(on_session_start, {"cwd": str(root), "source": "clear"})["hookSpecificOutput"]["additionalContext"]
+    assert "내handoff표식" in ctx and "남의handoff표식" not in ctx
+    assert cli_handoff_path(str(root), NOW, None).splitlines()[0].endswith("-1500.md")  # 세션을 모르면 예전 이름
+
+
+def test_startup_lists_other_terminals_recent_work():
+    root = _project()
+    _two_terminals(root)
+    ctx = build_context(root, "startup", datetime(2026, 11, 9, 15, 0))
+    assert "B작업표식" in ctx  # 가장 새 기록은 그대로 넣고
+    assert "다른 터미널" in ctx and "session=aaaa1111" in ctx and "A작업표식" in ctx  # 다른 줄기는 한 줄로 알린다
+    assert "어느 작업" in ctx
+    assert "B턴표식" in ctx and "A턴표식" not in ctx  # 이어 붙이는 턴은 고른 기록의 줄기 것만
+    old = build_context(root, "startup", datetime(2026, 11, 11, 15, 0))
+    assert "다른 터미널" not in old  # 하루 넘은 것은 알리지 않는다
+
+
+def test_startup_one_terminal_has_no_other_work_note():
+    root = _project()
+    _write_log(root, "2026-11-09", CKPT.replace("session=s", "session=aaaa1111")
+               + "\n## 2026-11-09 14:40 checkpoint tokens=1 session=dddd4444\n### 다음 액션\n이어서\n")
+    state = load_state(root)
+    state["dddd4444-x"] = {"from": "aaaa1111-x"}  # /clear로 이어진 같은 터미널
+    save_state(root, state)
+    assert "다른 터미널" not in build_context(root, "startup", datetime(2026, 11, 9, 15, 0))
+
+
+def test_checkpoint_written_right_before_clear_is_restored():
+    """체크포인트를 쓰자마자 /clear 하면 다음 Stop이 없다. 세션이 끝날 때 그 세션 이름으로 옮긴다."""
+    root = _project()
+    _two_terminals(root)
+    (root / ".leneu-session" / ".pending-checkpoint.md").write_text("### 다음 액션\n막쓴표식\n")
+    _capture(on_session_end, {"cwd": str(root), "session_id": "aaaa1111-x", "reason": "clear"})
+    assert "checkpoint tokens=? session=aaaa1111" in _log_text(root)
+    ctx = _capture(on_session_start, {"cwd": str(root), "source": "clear"})["hookSpecificOutput"]["additionalContext"]
+    assert "막쓴표식" in ctx and "B작업표식" not in ctx
+
+
+def test_checkpoint_of_unknown_session_is_not_filtered_out():
+    """비정상 종료로 주인을 모르는 체크포인트(session=?)는 어느 터미널에서도 놓치지 않는다."""
+    root = _project()
+    _two_terminals(root)
+    with (root / ".leneu-session" / "logs" / "2026-11-09.md").open("a") as f:
+        f.write("\n## 2026-11-09 14:50 checkpoint tokens=? session=?\n### 다음 액션\n주인모름표식\n")
+    _capture(on_session_end, {"cwd": str(root), "session_id": "aaaa1111-x", "reason": "clear"})
+    ctx = _capture(on_session_start, {"cwd": str(root), "source": "clear"})["hookSpecificOutput"]["additionalContext"]
+    assert "주인모름표식" in ctx
+
+
+def test_two_terminals_never_take_each_others_checkpoint():
+    root = _project()
+    r = checkpoint_reason(root, False, "aaaa1111-x")
+    mine = root / ".leneu-session" / ".pending-checkpoint-aaaa1111.md"
+    assert str(mine) in r and is_allowed_write(root, str(mine))
+    assert not is_allowed_write(root, str(root / ".leneu-session" / ".pending-checkpoint-x/y.md"))
+    mine.write_text("### 다음 액션\nA가쓴표식\n")
+    _stop(root, 47000, sid="bbbb2222-x")  # 다른 터미널의 턴이 먼저 끝나도
+    assert mine.exists() and "A가쓴표식" not in _log_text(root)
+    _stop(root, 47000, sid="aaaa1111-x")
+    assert "session=aaaa1111\n" in _log_text(root) and "A가쓴표식" in _log_text(root)
+
+
+def test_crash_leftover_keeps_its_owner_from_file_name():
+    root = _project()
+    (root / ".leneu-session" / ".pending-checkpoint-cccc3333.md").write_text("### 다음 액션\n남은표식\n")
+    _capture(on_session_start, {"cwd": str(root), "source": "startup"})
+    assert "session=cccc3333" in _log_text(root) and "남은표식" in _log_text(root)
+
+
+def test_turn_header_carries_session():
+    out = render_turn({"prompt": "p", "reply": "", "tools": [], "files": []}, NOW, session="6f74a221-d734")
+    assert "## 2026-11-09 15:00 turn session=6f74a221\n" in out
+    root = _project()
+    _stop(root, 47000, sid="6f74a221-zz", prompt="태그확인")
+    assert "turn session=6f74a221" in _log_text(root)
+
+
 def selftest():
     os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # 어디서 돌려도 대화형 기준으로 검사한다
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
@@ -1701,6 +2380,10 @@ if __name__ == "__main__":
     elif "--stop" in sys.argv:
         print(cli_stop(os.getcwd()))
     elif "--handoff-path" in sys.argv:
-        print(cli_handoff_path(os.getcwd(), datetime.now()))
+        print(cli_handoff_path(os.getcwd(), datetime.now(), os.environ.get("CLAUDE_CODE_SESSION_ID")))
+    elif "--brief-path" in sys.argv:
+        print(cli_brief_path(os.getcwd()))
+    elif "--secure" in sys.argv:
+        print(cli_secure(os.getcwd(), " ".join(sys.argv[sys.argv.index("--secure") + 1:])))
     else:
         main()

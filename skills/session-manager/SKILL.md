@@ -11,10 +11,11 @@ description: leneu-session의 복귀, 작업 로그 검색, 수동 기록. Use w
 
 ```
 .leneu-session/
-├── logs/YYYY-MM-DD.md   # 턴 기록, 체크포인트, 압축 시점. 삽입만 하며 영구 보존
+├── logs/YYYY-MM-DD.md   # 턴 기록, 체크포인트, 압축 시점. 삽입만 한다
 ├── handoffs/handoff-*.md # /leneu-handoff 문서. 최근 10개
 ├── project-brief.md      # /leneu-brief 문서
-├── config.json           # 선택. context_window, clear_recommend_pct, checkpoint_every_pct
+├── config.json           # 선택. context_window, clear_recommend_pct, checkpoint_every_pct, keep_log_days
+├── secure.json           # /leneu-secure 상태. enabled가 true면 보안 모드
 └── disabled              # 있으면 훅이 꺼진다
 ```
 
@@ -49,7 +50,7 @@ grep -rn -i -B2 -A8 "검색어" .leneu-session/logs .leneu-session/handoffs 2>/d
 
 ## 수동 기록
 
-사용자가 "이건 남겨줘"라고 하면 그 프로젝트의 오늘 로그 끝에 Bash로 append 한다. 시각은 `date` 로 얻는다. 과거 항목은 고치거나 지우지 않는다. 헤더 형식을 지켜야 복귀 검색이 깨지지 않으며 본문에는 `## ` 를 쓰지 않는다.
+사용자가 "이건 남겨줘"라고 하면 그 프로젝트의 오늘 로그 끝에 Bash로 append 한다. 시각은 `date` 로 얻는다. 과거 항목은 고치거나 지우지 않는다. 헤더 형식을 지켜야 복귀 검색이 깨지지 않으며 본문에는 `## ` 를 쓰지 않는다. 이 기록은 훅을 거치지 않으므로, `secure.json` 이 켜져 있으면 이메일·전화번호·내부 주소와 `terms` 의 단어를 직접 `[이메일]`, `[지정어-N]`(목록 순서) 식으로 가려 쓴다.
 
 ```markdown
 

@@ -8,6 +8,8 @@ allowed-tools: Bash, Read, Write, Glob, Grep, AskUserQuestion
 
 !`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/session_hook.py" --handoff-path`
 
+경로 대신 안내문이 나왔으면 그 안내문만 전하고 멈춘다. "보안 모드:" 줄이 있으면 그대로 따른다.
+
 위 경로에 지금까지의 작업을 인계 문서로 쓴다. 새 세션의 나는 이 대화를 전혀 모른다. 파일 경로, 함수명, 명령을 그대로 적는다. "그 함수", "아까 그 파일"은 다음 세션에서 의미가 없다.
 
 - **먼저 다 쓰고, 나중에 묻는다.** 대화에서 추론할 수 있는 것을 전부 채운 뒤 정말 모르는 것만 한 번에 확인한다. 확인할 게 없으면 묻지 않는다.

@@ -4,6 +4,10 @@ argument-hint: "[--test: 문서만 읽은 서브에이전트로 빈틈 검사]"
 allowed-tools: Bash, Read, Write, Glob, Grep, Agent
 ---
 
+브리프 경로 (하위 폴더에서 실행해도 프로젝트 루트를 가리킨다. 경로 대신 안내문이 나왔으면 그 안내문만 전하고 멈춘다):
+
+!`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/session_hook.py" --brief-path`
+
 이 프로젝트가 **무엇이고 어떻게 생겼는지**를 파일 하나로 정리한다. 받는 쪽은 다른 프로젝트에서 일하는 에이전트다. 이 저장소를 열어본 적도, 이 대화를 본 적도 없다.
 
 `/leneu-handoff` 와 혼동하지 않는다. 그건 *하던 작업*을 다음 세션에 넘기는 문서고, 이건 *프로젝트 자체*를 밖으로 설명하는 문서다. 진행 중인 작업은 여기서 맨 마지막 한 절이다.
@@ -12,7 +16,7 @@ allowed-tools: Bash, Read, Write, Glob, Grep, Agent
 
 ## 절차
 
-**0. 파일이 이미 있으면 먼저 읽는다.** `.leneu-session/project-brief.md` 가 있으면 갱신이다. 헤더의 `기준 커밋` 을 찾아 둔다.
+**0. 파일이 이미 있으면 먼저 읽는다.** 위 경로에 파일이 있으면 갱신이다. 헤더의 `기준 커밋` 을 찾아 둔다.
 
 **1. 저장소를 읽는다.** 대화보다 저장소가 먼저다.
 
@@ -34,13 +38,15 @@ find . -maxdepth 3 \( -name '.?*' -o -name node_modules -o -name dist -o -name b
 
 **2. 쌓아둔 기록을 읽는다.** "설계 결정"과 "함정" 절의 재료다. 대화에서만 가져오면, 그 결정을 겪지 않은 세션이 쓸 때 문서가 얇아진다.
 
+위 경로가 있는 폴더(`<폴더>`)의 기록을 본다.
+
 ```bash
-grep -rh -A6 -E '^### (결정|막다른 길)' .leneu-session/logs .leneu-session/handoffs 2>/dev/null | tail -200
+grep -rh -A6 -E '^### (결정|막다른 길)' <폴더>/logs <폴더>/handoffs 2>/dev/null | tail -200
 ```
 
 없으면 조용히 넘어간다. 그대로 옮기지 않는다. 로그는 그 시점의 기록이니 지금도 맞는지 저장소로 확인한다. **이미 뒤집힌 결정은 "예전엔 이랬고 지금은 이렇다"로 적는다.**
 
-**3. 문서를 쓴다** → `.leneu-session/project-brief.md`. 폴더가 없으면 만들고 `.leneu-session/.gitignore` 에 `*` 를 넣되, `disabled` 파일도 함께 만들어 자동 기록은 켜지 않는다. 시각은 `date "+%Y-%m-%d %H:%M"` 으로 얻는다.
+**3. 문서를 쓴다** → 위 경로. 폴더는 이미 준비되어 있다. 시각은 `date "+%Y-%m-%d %H:%M"` 으로 얻는다.
 
 ```markdown
 # <프로젝트명> — 프로젝트 브리프
